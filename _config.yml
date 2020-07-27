@@ -1,0 +1,15 @@
+# Site settings
+title: Mauricio Urraco
+description: Jekyll Theme Minimal Resume
+remote_theme : murraco/jekyll-theme-minimal-resume
+# baseurl: "" # the subpath of your site, e.g. /blog
+# url: "whguswka.github.io" # the base hostname & protocol for your site e.g. http://willianjusten.com.br
+
+# User settings
+username: Hyun Jam Jo
+user_description: 
+user_title: Statistician
+email: whguswka@outlook.kr
+# github_username:  whguswka
+
+exclude: ['package.json', 'src' , 'node_modules']
