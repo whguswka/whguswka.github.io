@@ -1,0 +1,14 @@
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+    mermaid.initialize({ startOnLoad: false, theme: "default" });
+    var codeBlocks = document.querySelectorAll("pre > code.language-mermaid");
+    codeBlocks.forEach(function (codeEl) {
+        var pre = codeEl.parentElement;
+        var div = document.createElement("div");
+        div.className = "mermaid";
+        div.textContent = codeEl.textContent;
+        pre.parentNode.insertBefore(div, pre);
+        pre.style.display = "none";
+    });
+    mermaid.run();
+</script>
