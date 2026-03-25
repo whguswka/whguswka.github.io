@@ -1,13 +1,135 @@
----
-# Only the main Sass file needs front matter
----
-
-@charset "utf-8";
+--- # Only the main Sass file needs front matter --- @charset "utf-8";
 
 /* Override font variables before importing theme */
 $sans-serif: "D2Coding", "IBM Plex Mono", "NanumGothicCoding", monospace !default;
 $monospace: "IBM Plex Mono", "D2Coding", "NanumGothicCoding", Consolas, monospace !default;
 $global-font-family: $sans-serif;
+$type-size-1: 1.563em !default;
+/* post title - smaller to prevent wrapping */
+$type-size-2: 1.25em !default;
+$type-size-3: 1.125em !default;
+$type-size-4: 1em !default;
+$type-size-5: 0.875em !default;
+$type-size-6: 0.8em !default;
+$type-size-7: 0.7em !default;
+$type-size-8: 0.625em !default;
+
+/* Pure black background override */
+$background-color: #000000 !default;
+$footer-background-color: #000000 !default;
 
 @import "minimal-mistakes/skins/dark";
 @import "minimal-mistakes";
+
+/* === Pure black background === */
+body {
+    background-color: #000000 !important;
+}
+
+.page {
+    background-color: #000000;
+}
+
+.masthead {
+    background-color: #000000;
+    border-bottom: 1px solid #222;
+}
+
+.page__footer {
+    background-color: #000000;
+}
+
+.sidebar {
+    background-color: #000000;
+}
+
+/* === Consistent font across everything === */
+.masthead__menu-item,
+.greedy-nav a,
+.greedy-nav .visible-links a,
+.site-title,
+.masthead .site-title {
+    font-family: "D2Coding", "IBM Plex Mono", monospace !important;
+    font-size: 0.85rem !important;
+}
+
+.site-title {
+    font-size: 1rem !important;
+}
+
+/* === Fix author bio horizontal scroll === */
+.author__bio,
+.author__urls-wrapper,
+.author__content {
+    font-size: 0.75rem;
+    word-break: keep-all;
+    overflow-wrap: break-word;
+}
+
+.author__name {
+    font-family: "D2Coding", "IBM Plex Mono", monospace;
+    font-size: 0.9rem;
+}
+
+.sidebar {
+    overflow-x: hidden;
+}
+
+/* === Post title sizing - prevent wrapping === */
+.archive__item-title {
+    font-size: 1rem !important;
+    line-height: 1.4;
+}
+
+.page__title {
+    font-size: 1.4rem;
+}
+
+/* === Post excerpt === */
+.archive__item-excerpt {
+    font-size: 0.8rem;
+}
+
+/* === Reading time === */
+.page__meta {
+    font-size: 0.7rem;
+}
+
+/* === Consistent body font === */
+body,
+p,
+li,
+td,
+th,
+.page__content,
+.page__content p,
+.page__content li {
+    font-family: "D2Coding", "IBM Plex Mono", monospace;
+    font-size: 0.85rem;
+    line-height: 1.7;
+}
+
+/* === Code blocks === */
+code,
+pre,
+.highlight {
+    font-family: "IBM Plex Mono", "D2Coding", Consolas, monospace !important;
+    font-size: 0.8rem;
+}
+
+/* === Navigation search icon === */
+.greedy-nav .search__toggle {
+    color: #ccc;
+}
+
+/* === Recent posts heading === */
+.archive__subtitle {
+    font-size: 1rem;
+    border-bottom: 1px solid #333;
+}
+
+/* === TOC === */
+.toc__menu a {
+    font-size: 0.75rem;
+    font-family: "D2Coding", "IBM Plex Mono", monospace;
+}
