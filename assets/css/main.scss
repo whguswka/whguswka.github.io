@@ -1,0 +1,13 @@
+---
+# Only the main Sass file needs front matter
+---
+
+@charset "utf-8";
+
+/* Override font variables before importing theme */
+$sans-serif: "D2Coding", "IBM Plex Mono", "NanumGothicCoding", monospace !default;
+$monospace: "IBM Plex Mono", "D2Coding", "NanumGothicCoding", Consolas, monospace !default;
+$global-font-family: $sans-serif;
+
+@import "minimal-mistakes/skins/dark";
+@import "minimal-mistakes";
