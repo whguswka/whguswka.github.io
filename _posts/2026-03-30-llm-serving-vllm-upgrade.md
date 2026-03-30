@@ -104,54 +104,6 @@ vLLM은 이를 위해 [Ray](https://docs.ray.io/)를 분산 실행 백엔드로 
 
 ---
 
-## launch-cluster.sh -- 클러스터 시작 과정
-
-DGX Spark에서 vLLM을 서빙하기 위해 [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) 프로젝트의 `launch-cluster.sh` 스크립트를 사용한다. 822줄짜리 이 스크립트가 수행하는 작업을 순서도로 정리하면 다음과 같다 (코드 수준의 상세 흐름은 [부록](#부록-launch-clustersh-실행-흐름-상세) 참조):
-
-```mermaid
-flowchart TD
-    A["launch-cluster.sh 실행"] --> B["인터페이스 자동 감지<br/>(QSFP, Ethernet IP)"]
-    B --> C["노드 자동 탐색<br/>(SSH peer scan)"]
-    C --> D{"액션 분기"}
-
-    D -->|stop| E["양 노드 컨테이너 중지<br/>(docker stop/rm)"]
-    D -->|start / exec| F["start_cluster()"]
-
-    F --> G["Head 노드 컨테이너 시작<br/>(docker run ... sleep infinity)"]
-    G --> H["Worker 노드 컨테이너 시작<br/>(SSH로 원격 docker run)"]
-    H --> I{"mod 적용"}
-
-    I --> J["각 mod의 run.sh를<br/>양 노드 컨테이너에서 실행<br/>(patch, 파일 복사 등)"]
-    J --> K{"--no-ray?"}
-
-    K -->|Ray 모드| L["Ray Head 시작<br/>(ray start --head)"]
-    L --> M["Ray Worker 시작<br/>(SSH → ray start --address)"]
-    M --> N["클러스터 준비 대기<br/>(ray status 폴링)"]
-
-    K -->|No-Ray 모드| O["PyTorch distributed<br/>직접 사용"]
-
-    N --> P{"exec 액션?"}
-    O --> P
-
-    P -->|exec| Q["docker exec -d vllm_node<br/>vllm serve ... (백그라운드)"]
-    P -->|start| R["docker logs -f<br/>(로그 tail)"]
-
-    Q --> S["서빙 시작 완료"]
-
-    style A fill:#1a3a5c,stroke:#2e7bb5,color:#fff
-    style S fill:#2d5016,stroke:#4a8c2a,color:#fff
-    style E fill:#8b0000,stroke:#ff4444,color:#fff
-```
-
-핵심 포인트는 **mod 시스템**이다. `--apply-mod` 옵션으로 지정한 디렉토리 안의 `run.sh`가 컨테이너 내부에서 실행되어, vLLM 소스 코드를 실행 시점에 패치한다. 이를 통해 vLLM 이미지를 다시 빌드하지 않고도 기능을 추가하거나 버그를 수정할 수 있다:
-
-- `gpu-mem-util-gb`: `--gpu-memory-utilization-gb` 파라미터 지원 추가
-- `fix-qwen3.5-autoround`: Qwen3.5 모델의 AutoRound INT4 양자화 호환성 패치
-- `fix-qwen3.5-chat-template`: Unsloth 포맷 채팅 템플릿 적용
-- `fix-ray-gpu-check`: stale placement group 자동 정리 (이번 장애에서 새로 생성)
-
----
-
 ## 397B 서빙 성공 -- 그리고 장애
 
 ### 첫 서빙 성공
@@ -405,7 +357,53 @@ vLLM에는 아직 공식 통합되지 않았으나([관련 이슈](https://githu
 
 ## 부록: launch-cluster.sh 실행 흐름 상세
 
-본문의 순서도를 보충하여, `launch-cluster.sh`의 주요 함수와 실행 흐름을 코드 수준에서 정리한다. 전체 스크립트는 822줄이므로 핵심 로직만 발췌한다.
+DGX Spark에서 vLLM을 서빙하기 위해 [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) 프로젝트의 `launch-cluster.sh` 스크립트를 사용한다. 전체 822줄 중 핵심 로직을 순서도와 코드 발췌로 정리한다.
+
+### 실행 순서도
+
+```mermaid
+flowchart TD
+    A["launch-cluster.sh 실행"] --> B["인터페이스 자동 감지<br/>(QSFP, Ethernet IP)"]
+    B --> C["노드 자동 탐색<br/>(SSH peer scan)"]
+    C --> D{"액션 분기"}
+
+    D -->|stop| E["양 노드 컨테이너 중지<br/>(docker stop/rm)"]
+    D -->|start / exec| F["start_cluster()"]
+
+    F --> G["Head 노드 컨테이너 시작<br/>(docker run ... sleep infinity)"]
+    G --> H["Worker 노드 컨테이너 시작<br/>(SSH로 원격 docker run)"]
+    H --> I{"mod 적용"}
+
+    I --> J["각 mod의 run.sh를<br/>양 노드 컨테이너에서 실행<br/>(patch, 파일 복사 등)"]
+    J --> K{"--no-ray?"}
+
+    K -->|Ray 모드| L["Ray Head 시작<br/>(ray start --head)"]
+    L --> M["Ray Worker 시작<br/>(SSH → ray start --address)"]
+    M --> N["클러스터 준비 대기<br/>(ray status 폴링)"]
+
+    K -->|No-Ray 모드| O["PyTorch distributed<br/>직접 사용"]
+
+    N --> P{"exec 액션?"}
+    O --> P
+
+    P -->|exec| Q["docker exec -d vllm_node<br/>vllm serve ... (백그라운드)"]
+    P -->|start| R["docker logs -f<br/>(로그 tail)"]
+
+    Q --> S["서빙 시작 완료"]
+
+    style A fill:#1a3a5c,stroke:#2e7bb5,color:#fff
+    style S fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style E fill:#8b0000,stroke:#ff4444,color:#fff
+```
+
+### mod 시스템
+
+`--apply-mod` 옵션으로 지정한 디렉토리 안의 `run.sh`가 컨테이너 내부에서 실행되어, vLLM 소스 코드를 실행 시점에 패치한다. 이를 통해 vLLM 이미지를 다시 빌드하지 않고도 기능을 추가하거나 버그를 수정할 수 있다:
+
+- `gpu-mem-util-gb`: `--gpu-memory-utilization-gb` 파라미터 지원 추가
+- `fix-qwen3.5-autoround`: Qwen3.5 모델의 AutoRound INT4 양자화 호환성 패치
+- `fix-qwen3.5-chat-template`: Unsloth 포맷 채팅 템플릿 적용
+- `fix-ray-gpu-check`: stale placement group 자동 정리 (이번 장애에서 새로 생성)
 
 ### 전체 구조
 
