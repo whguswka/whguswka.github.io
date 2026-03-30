@@ -1,6 +1,6 @@
 ---
-title: "LLM 서빙 인프라 (3) -- vLLM 0.18 업그레이드와 397B 모델 서빙기"
-excerpt: "vLLM 0.18의 FP8 KV 캐시와 gpu-memory-utilization-gb 기능으로 397B 모델 서빙이 가능해진 과정, 커널 업데이트로 인한 서빙 장애와 롤백까지의 삽질 기록을 정리합니다."
+title: "LLM 서빙 인프라 (3) — vLLM 0.18 업그레이드, Qwen3.5-397B 서빙, 그리고 커널 롤백"
+excerpt: "vLLM 0.18의 FP8 KV 캐시와 절대 메모리 할당 패치로 Qwen3.5-397B 262K 서빙에 성공했다. 하지만 커널/드라이버 업데이트로 장애가 발생했고, Ray placement group·systemd·메모리 문제를 추적한 끝에 커널 롤백으로 복구했다."
 categories:
   - Infrastructure
 tags:
@@ -26,7 +26,7 @@ vLLM 0.18로 업그레이드하면서 이전에는 올릴 수 없었던 **Qwen3.
 
 1. vLLM 0.18의 어떤 기능이 397B 서빙을 가능하게 했는가
 2. 커널 업데이트가 왜 LLM 서빙을 망가뜨렸는가
-3. 디버깅 과정에서 발견한 vLLM v1 엔진의 구조적 버그와 해결
+3. 디버깅 과정에서 드러난 vLLM v1/Ray 조합의 운영상 문제와 대응
 
 ---
 
@@ -34,7 +34,7 @@ vLLM 0.18로 업그레이드하면서 이전에는 올릴 수 없었던 **Qwen3.
 
 이전 글에서 언급했듯이, 122B-FP8(활성 10B)은 안정적이었지만 코딩 에이전트로서의 역량에 한계가 있었다. 복잡한 멀티파일 리팩터링이나 아키텍처 설계 같은 작업에서는 모델 규모의 벽이 느껴졌다.
 
-Qwen3.5-397B-A17B는 MoE 구조로 전체 397B 파라미터 중 요청당 17B만 활성화된다. INT4(AutoRound) 양자화를 적용하면 모델 가중치가 약 100GB로, DGX Spark 2노드(~240GB)에 올라갈 수 있는 크기다.
+Qwen3.5-397B-A17B는 MoE 구조로 전체 397B 파라미터 중 요청당 17B만 활성화된다. INT4(AutoRound) 양자화를 적용하면 모델 가중치는 대략 100GB 수준으로, DGX Spark 2노드(~240GB)에 올라갈 수 있는 크기다.
 
 문제는 "올라갈 수 있다"와 "서빙할 수 있다"는 다르다는 것이었다. 모델 가중치 100GB를 적재하고 나면 KV 캐시에 할당할 메모리가 거의 남지 않았다. 이전 vLLM 버전에서는 이 조합이 불가능했다.
 
@@ -53,6 +53,8 @@ KV 캐시는 추론 시 각 토큰의 Key/Value 텐서를 저장하는 공간이
 | FP16 | 기준 | 기준 |
 | FP8 | **50%** | **2배** |
 
+> 실제 확보 가능한 컨텍스트 증가는 모델 구조와 구현 세부사항에 따라 다르지만, FP8 KV 캐시는 FP16 대비 KV 캐시 메모리를 대체로 절반 수준으로 줄여준다.
+
 모델 가중치 100GB를 적재한 후 남는 ~12GB에서, FP16이었다면 짧은 컨텍스트만 가능했겠지만 FP8 KV 캐시 덕분에 2배의 컨텍스트를 확보할 수 있었다.
 
 ```bash
@@ -65,7 +67,7 @@ KV 캐시는 추론 시 각 토큰의 Key/Value 텐서를 저장하는 공간이
 
 DGX Spark의 UMA(통합 메모리) 환경에서 이것은 문제가 된다. `nvidia-smi`가 VRAM을 `N/A`로 보고하므로, vLLM이 "전체 GPU 메모리"를 정확히 파악하지 못할 수 있다. 비율 기반 설정은 환경에 따라 예측 불가능한 결과를 낳는다.
 
-vLLM 0.18에서 추가된 `--gpu-memory-utilization-gb` 파라미터는 **절대값(GiB)**으로 메모리 사용량을 지정한다:
+공식 vLLM 기능은 아니지만, DGX Spark용 커뮤니티 프로젝트([spark-vllm-docker](https://github.com/eugr/spark-vllm-docker))에서 제공하는 `--gpu-memory-utilization-gb` 파라미터는 **절대값(GiB)**으로 메모리 사용량을 지정한다:
 
 ```bash
 --gpu-memory-utilization-gb 112  # 정확히 112GB 사용
@@ -88,7 +90,7 @@ vLLM 0.18은 **v1 엔진**이 기본값이다. v0 엔진과의 주요 차이:
 - **SchedulerOutput 최적화**: 청크 프리필(chunked prefill)과 prefix caching이 개선되었다
 - **Compiled DAG 지원**: Ray를 통한 분산 실행 시 컴파일된 DAG로 오버헤드를 줄인다
 
-이 아키텍처 변경은 성능에 긍정적이었지만, 나중에 예상치 못한 버그의 원인이 되기도 했다.
+이 구조는 성능상 이점이 있었지만, 프로세스와 리소스 상태가 꼬였을 때 원인 파악을 더 어렵게 만들었다.
 
 ### 분산 추론 백엔드: Ray
 
@@ -100,7 +102,7 @@ vLLM은 이를 위해 [Ray](https://docs.ray.io/)를 분산 실행 백엔드로 
 - **Placement Group**: GPU, CPU 같은 리소스를 논리적으로 묶어 예약하는 단위다. vLLM은 TP 수만큼의 GPU를 placement group으로 예약하여 다른 프로세스가 사용하지 못하게 보호한다
 - **Actor**: Ray에서 상태를 가진 원격 객체다. vLLM은 각 GPU에서 실행되는 `RayWorkerWrapper`를 Actor로 생성하여 모델 추론을 수행한다
 
-이 구조에서 핵심은 **placement group이 GPU 리소스의 독점적 예약을 보장**한다는 점이다. 이것이 나중에 문제가 된다.
+이 구조에서 핵심은 **placement group이 GPU 리소스를 선점·예약하여 다른 워크로드와의 경합을 줄인다**는 점이다. 이것이 나중에 문제가 된다.
 
 ---
 
@@ -144,13 +146,20 @@ ValueError: Current node has no GPU available.
 current_node_resource={'accelerator_type:GB10': 1.0, 'CPU': 2.0, ...}
 ```
 
-GPU가 분명히 존재하는데(accelerator_type:GB10이 보인다) "GPU가 없다"는 에러. 여기서부터 6시간의 디버깅이 시작됐다.
+물리 GPU는 인식되는데(accelerator_type:GB10이 보인다), Ray 스케줄러는 사용 가능한 GPU를 0으로 보고하고 있었다. 여기서부터 6시간의 디버깅이 시작됐다.
 
 ---
 
-## 디버깅 -- 세 개의 버그가 겹쳐 있었다
+## 디버깅 -- 세 개의 문제가 겹쳐 있었다
 
-### 버그 1: Ray Placement Group 충돌
+이번 장애는 하나의 원인이 아니라 세 층위가 겹친 사건이었다.
+1. **직접 계기**는 커널/드라이버 업데이트로 인한 메모리 동작 변화였고,
+2. **관측된 첫 증상**은 Ray placement group 충돌이었으며,
+3. **복구를 어렵게 만든 운영 이슈**는 systemd의 재시작 정책이었다.
+
+아래에서는 이 세 문제를 순서대로 분리해 설명한다.
+
+### 문제 1: Ray Placement Group 잔존 상태로 인한 GPU 감지 실패
 
 vLLM v1 엔진은 APIServer와 EngineCore를 별도 프로세스로 실행한다. EngineCore가 Ray 클러스터에 연결할 때, 이전 EngineCore(또는 다른 vLLM 인스턴스)가 생성한 **placement group이 GPU 리소스를 전량 점유**하고 있으면 "GPU 없음" 에러가 발생한다.
 
@@ -161,11 +170,11 @@ if current_node_resource.get("GPU", 0) < 1:
     raise ValueError("Current node has no GPU available.")
 ```
 
-`available_resources_per_node()`는 placement group에 할당된 리소스를 제외한 "사용 가능한" 리소스를 반환한다. 이전 프로세스의 placement group이 정리되지 않으면, 실제로는 GPU가 있어도 0으로 보고된다.
+`available_resources_per_node()`는 placement group에 할당된 리소스를 제외한 "사용 가능한" 리소스를 반환한다. 이전 프로세스의 placement group이 정리되지 않으면, 실제로는 GPU가 있어도 0으로 보고된다. 즉, "이 머신에 GPU가 아예 없다"는 뜻이 아니라, Ray가 지금 당장 할당 가능한 GPU 리소스를 0으로 계산했다는 의미였다. 물리 GPU 존재 여부와 스케줄러가 보고하는 사용 가능 자원은 다르다.
 
 **해결**: stale placement group을 감지하여 자동으로 정리하는 패치를 작성했다. `ray.cluster_resources()`로 클러스터 전체의 GPU 존재를 확인한 후, stale PG를 제거하고 새 PG를 생성한다. 이 패치는 `fix-ray-gpu-check`라는 이름의 mod로 launch-cluster.sh에 통합했다.
 
-### 버그 2: systemd 서비스의 이중 실행
+### 문제 2: systemd 재시작 정책으로 인한 이중 실행
 
 vLLM 클러스터를 관리하는 systemd 서비스(`vllm-cluster.service`)가 `Restart=on-failure`로 설정되어 있었다. vLLM이 placement group 에러로 실패하면, 30초 후 systemd가 재시작을 시도한다. 이 재시작된 프로세스와 수동으로 실행한 프로세스가 **동시에 GPU를 놓고 경쟁**하면서 서로의 placement group을 "stale"로 판단하고 제거하는 악순환이 발생했다.
 
@@ -194,7 +203,7 @@ PID 5477 vllm serve ... --gpu-memory-utilization-gb 100  # systemd 재시작
 - `Type=simple`이면: 메인 프로세스가 종료되었으므로 역시 "중지"로 판단 → Restart=on-failure 작동 → 무한 재시작
 - `Type=oneshot` + `RemainAfterExit=yes`면: 스크립트 정상 종료(exit 0) 후 서비스를 "active" 상태로 유지 → 재시작 없음
 
-### 버그 3: 커널/드라이버 업그레이드에 의한 메모리 관리 변경
+### 문제 3: 커널/드라이버 업데이트 후 메모리 여유 감소
 
 placement group 문제를 해결하고 나니, **새로운 문제**가 드러났다:
 
@@ -205,7 +214,7 @@ Available KV cache memory: -3.93 GiB
 
 `--gpu-memory-utilization-gb 100`으로 100GB를 할당했는데, 모델이 ~104GB를 사용하여 KV 캐시에 할당할 메모리가 **-3.93GB**(부족)였다. 아침에는 같은 설정으로 정상 동작했는데?
 
-원인은 **NVIDIA 드라이버 580.126.09 → 580.142 업그레이드와 커널 6.17.0-1008 → 1014 업그레이드**였다. 새 드라이버/커널 조합에서 UMA 메모리 관리 방식이 변경되어, 동일한 모델에 더 많은 GPU 메모리가 필요해졌다.
+가장 유력한 원인은 **NVIDIA 드라이버 580.126.09 → 580.142와 커널 6.17.0-1008 → 1014 업그레이드** 이후 발생한 메모리 동작 변화였다. 업데이트 이후 동일 설정에서 모델 적재 메모리가 증가한 것으로 보아, 새 드라이버/커널 조합의 UMA 메모리 관리 방식에 변경이 있었던 것으로 추정된다.
 
 #### 커널 업데이트 전후 비교
 
@@ -217,6 +226,8 @@ Available KV cache memory: -3.93 GiB
 | CUDA 그래프 컴파일 | ~5분 | **50분+ (멈춤)** |
 | `--enforce-eager` 필요 | 불필요 | **필요** |
 | 262K 컨텍스트 | 가능 | **32K만 가능** (112GB에서도) |
+
+> 수치는 vLLM 시작 로그와 실제 기동 시 관측값을 바탕으로 한 근사치다.
 
 새 커널/드라이버에서는 `--enforce-eager`(CUDA 그래프 비활성화) 없이는 서버가 시작조차 되지 않았다. CUDA 그래프 컴파일이 50분 이상 CPU 100%로 실행되다가 결국 타임아웃되는 현상이 발생했다. `--enforce-eager`를 추가하면 서버는 시작되지만, KV 캐시 메모리 제약으로 `--max-model-len`을 32768로 크게 낮춰야 했다.
 
@@ -246,7 +257,7 @@ sudo sed -i "s/GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/" /etc/default/grub
 sudo update-grub
 ```
 
-한 가지 주의: DGX Spark의 `grub.cfg`는 기본적으로 비어있다. 커널 업데이트 후 `sudo update-grub`을 실행하지 않으면 GRUB 메뉴가 생성되지 않는다. 이 경우 GRUB은 fallback 동작으로 가장 최신 커널을 자동 부팅한다.
+한 가지 주의: 내 환경에서는 커널 업데이트 직후 `grub.cfg`에 기대한 menuentry가 보이지 않았다. 커널 업데이트 후 `sudo update-grub`을 실행하지 않으면 GRUB 메뉴가 생성되지 않는다. 이 경우 GRUB은 fallback 동작으로 가장 최신 커널을 자동 부팅한다.
 
 ### 롤백 결과
 
@@ -316,9 +327,9 @@ sudo apt-mark hold nvidia-driver-580-open libnvidia-compute-580 \
 
 ### 3. 디버깅 시 근본 원인과 파생 문제를 구분하라
 
-이번 장애에서는 세 개의 버그가 겹쳐 있었다:
+이번 장애에서는 세 개의 문제가 겹쳐 있었다:
 - **근본 원인**: 커널/드라이버 업그레이드로 인한 메모리 관리 변경
-- **파생 문제 1**: Ray placement group 충돌 (v1 엔진 구조적 이슈)
+- **파생 문제 1**: Ray placement group 잔존 (v1 엔진/Ray 운영 이슈)
 - **파생 문제 2**: systemd의 이중 실행
 
 처음에는 placement group 문제만 보였고, 이를 해결하니 메모리 문제가 드러났고, 메모리를 조정하니 systemd 이중 실행이 발견됐다. 각 문제를 개별적으로 해결하면서 6시간을 소비했는데, 처음부터 "아침에 됐던 것이 왜 안 되는가?"라는 질문에 집중했다면 커널 롤백이라는 답에 더 빨리 도달했을 것이다.
@@ -335,27 +346,19 @@ sudo apt-mark hold nvidia-driver-580-open libnvidia-compute-580 \
 - vLLM 업스트림에 DGX Spark UMA 환경에서의 placement group 이슈를 보고
 - NVIDIA 드라이버 580.142에서의 UMA 메모리 할당 변경사항을 추적
 
-### 중장기: TurboQuant를 통한 KV 캐시 메모리 혁신
+### 중장기: KV 캐시 압축 기술
 
-이번 장애의 본질적 원인은 **397B 모델 가중치가 GPU 메모리의 대부분을 차지하여 KV 캐시에 할당할 여유가 부족**하다는 것이다. FP8 KV 캐시로 2배의 효율을 얻었지만, 262K 컨텍스트에서는 여전히 빠듯하다.
-
-[TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)는 Google이 ICLR 2026에서 발표한 KV 캐시 압축 알고리즘으로, 이 문제에 대한 근본적인 해법이 될 수 있다:
-
-- **KV 캐시를 3-bit(Key) + 2-bit(Value)로 극단적 압축**: FP8(8-bit) 대비 약 3배 추가 절약, FP16 대비 약 **6배** 메모리 절약
-- **학습/파인튜닝 불필요**: 추론 시점에 KV 캐시에만 적용하므로 기존 모델을 그대로 사용
-- **정밀도 유지**: PolarQuant(극좌표 변환)와 QJL(1-bit 오차 보정) 두 단계로 압축하여, 일부 벤치마크에서 full-precision과 동등한 성능
-
-현재 FP8 KV 캐시로 262K 컨텍스트에 ~12GB를 사용하고 있는데, TurboQuant를 적용하면 동일 메모리에서 이론적으로 **~750K+ 컨텍스트**가 가능해진다. 또는 동일 컨텍스트에서 더 많은 동시 요청을 처리할 수 있다.
-
-vLLM에는 아직 공식 통합되지 않았으나([관련 이슈](https://github.com/vllm-project/vllm/issues/38171)), Google의 공식 구현이 2026년 Q2에 공개될 예정이며, 독립 개발자들의 Triton 커널 기반 구현도 이미 존재한다. TurboQuant + vLLM 조합은 DGX Spark처럼 메모리가 제한된 환경에서 초거대 모델을 서빙하면서도 충분한 컨텍스트를 확보하는 핵심 기술이 될 것이다.
+이번 장애의 본질적 원인은 397B 모델 가중치가 GPU 메모리의 대부분을 차지하여 KV 캐시에 할당할 여유가 부족하다는 것이다. 더 근본적으로는 KV 캐시 메모리 자체를 줄여야 한다. FP8이 현재 해법이라면, 앞으로는 [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)처럼 KV 캐시를 3-bit(Key) + 2-bit(Value)로 극단적 압축하는 기법이 이 문제를 바꿀 수 있다. 아직 vLLM 공식 통합은 없지만, 메모리 제약이 큰 환경에서는 가장 주목할 기술 중 하나다.
 
 ---
 
-현재 구성은 안정적으로 동작하고 있으며, AI 코딩 에이전트(OpenClaw)에서 397B 모델을 262K 컨텍스트로 활용하고 있다.
+이 글 작성 시점(2026년 3월) 기준으로, 커널 롤백 후 수일간 안정적으로 동작하고 있으며, AI 코딩 에이전트(OpenClaw)에서 397B 모델을 262K 컨텍스트로 활용하고 있다.
 
 ---
 
 ## 부록: launch-cluster.sh 실행 흐름 상세
+
+> 아래는 본문과 별개로, 이후 같은 문제를 다시 만났을 때 참고하려고 남긴 운영 메모에 가깝다.
 
 DGX Spark에서 vLLM을 서빙하기 위해 [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) 프로젝트의 `launch-cluster.sh` 스크립트를 사용한다. 전체 822줄 중 핵심 로직을 순서도와 코드 발췌로 정리한다.
 
