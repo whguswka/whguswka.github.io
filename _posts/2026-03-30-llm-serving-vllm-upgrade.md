@@ -10,6 +10,8 @@ tags:
   - NVIDIA
   - Kernel
   - Blackwell
+  - Ray
+  - TurboQuant
 toc: true
 toc_sticky: true
 ---
@@ -88,6 +90,66 @@ vLLM 0.18은 **v1 엔진**이 기본값이다. v0 엔진과의 주요 차이:
 
 이 아키텍처 변경은 성능에 긍정적이었지만, 나중에 예상치 못한 버그의 원인이 되기도 했다.
 
+### 분산 추론 백엔드: Ray
+
+DGX Spark 2노드로 397B 모델을 서빙하려면 **Tensor Parallelism(TP)**이 필수다. 하나의 GPU에 모델 전체를 올릴 수 없으므로, 모델 가중치를 2개 GPU에 분할하고 추론 시 AllReduce로 동기화해야 한다.
+
+vLLM은 이를 위해 [Ray](https://docs.ray.io/)를 분산 실행 백엔드로 사용한다. Ray는 Python 기반 분산 컴퓨팅 프레임워크로, 주요 개념은 다음과 같다:
+
+- **Ray Cluster**: Head 노드(스케줄러)와 Worker 노드(실행기)로 구성된다. 우리 환경에서는 228이 Head, 237이 Worker다
+- **Placement Group**: GPU, CPU 같은 리소스를 논리적으로 묶어 예약하는 단위다. vLLM은 TP 수만큼의 GPU를 placement group으로 예약하여 다른 프로세스가 사용하지 못하게 보호한다
+- **Actor**: Ray에서 상태를 가진 원격 객체다. vLLM은 각 GPU에서 실행되는 `RayWorkerWrapper`를 Actor로 생성하여 모델 추론을 수행한다
+
+이 구조에서 핵심은 **placement group이 GPU 리소스의 독점적 예약을 보장**한다는 점이다. 이것이 나중에 문제가 된다.
+
+---
+
+## launch-cluster.sh -- 클러스터 시작 과정
+
+DGX Spark에서 vLLM을 서빙하기 위해 [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) 프로젝트의 `launch-cluster.sh` 스크립트를 사용한다. 822줄짜리 이 스크립트가 수행하는 작업을 순서도로 정리하면 다음과 같다:
+
+```mermaid
+flowchart TD
+    A["launch-cluster.sh 실행"] --> B["인터페이스 자동 감지<br/>(QSFP, Ethernet IP)"]
+    B --> C["노드 자동 탐색<br/>(SSH peer scan)"]
+    C --> D{"액션 분기"}
+
+    D -->|stop| E["양 노드 컨테이너 중지<br/>(docker stop/rm)"]
+    D -->|start / exec| F["start_cluster()"]
+
+    F --> G["Head 노드 컨테이너 시작<br/>(docker run ... sleep infinity)"]
+    G --> H["Worker 노드 컨테이너 시작<br/>(SSH로 원격 docker run)"]
+    H --> I{"mod 적용"}
+
+    I --> J["각 mod의 run.sh를<br/>양 노드 컨테이너에서 실행<br/>(patch, 파일 복사 등)"]
+    J --> K{"--no-ray?"}
+
+    K -->|Ray 모드| L["Ray Head 시작<br/>(ray start --head)"]
+    L --> M["Ray Worker 시작<br/>(SSH → ray start --address)"]
+    M --> N["클러스터 준비 대기<br/>(ray status 폴링)"]
+
+    K -->|No-Ray 모드| O["PyTorch distributed<br/>직접 사용"]
+
+    N --> P{"exec 액션?"}
+    O --> P
+
+    P -->|exec| Q["docker exec -d vllm_node<br/>vllm serve ... (백그라운드)"]
+    P -->|start| R["docker logs -f<br/>(로그 tail)"]
+
+    Q --> S["서빙 시작 완료"]
+
+    style A fill:#1a3a5c,stroke:#2e7bb5,color:#fff
+    style S fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style E fill:#8b0000,stroke:#ff4444,color:#fff
+```
+
+핵심 포인트는 **mod 시스템**이다. `--apply-mod` 옵션으로 지정한 디렉토리 안의 `run.sh`가 컨테이너 내부에서 실행되어, vLLM 소스 코드를 실행 시점에 패치한다. 이를 통해 vLLM 이미지를 다시 빌드하지 않고도 기능을 추가하거나 버그를 수정할 수 있다:
+
+- `gpu-mem-util-gb`: `--gpu-memory-utilization-gb` 파라미터 지원 추가
+- `fix-qwen3.5-autoround`: Qwen3.5 모델의 AutoRound INT4 양자화 호환성 패치
+- `fix-qwen3.5-chat-template`: Unsloth 포맷 채팅 템플릿 적용
+- `fix-ray-gpu-check`: stale placement group 자동 정리 (이번 장애에서 새로 생성)
+
 ---
 
 ## 397B 서빙 성공 -- 그리고 장애
@@ -105,9 +167,9 @@ GPU 메모리: 112GB
 Tensor Parallel: 2 (228 Head + 237 Worker)
 ```
 
-OpenClaw(텔레그램 봇 에이전트)를 통해 정상 동작을 확인했다. tool calling과 reasoning 모두 정상이었다.
+OpenClaw(디스코드 봇 에이전트)를 통해 정상 동작을 확인했다. tool calling과 reasoning 모두 정상이었다.
 
-### apt upgrade -- 재앙의 시작
+### apt upgrade -- 장애의 근본적 원인
 
 같은 날 오후, 시스템 패키지 업데이트를 실행했다:
 
@@ -149,7 +211,7 @@ if current_node_resource.get("GPU", 0) < 1:
 
 `available_resources_per_node()`는 placement group에 할당된 리소스를 제외한 "사용 가능한" 리소스를 반환한다. 이전 프로세스의 placement group이 정리되지 않으면, 실제로는 GPU가 있어도 0으로 보고된다.
 
-**해결**: stale placement group을 감지하여 자동으로 정리하는 패치를 작성했다. `ray.cluster_resources()`로 클러스터 전체의 GPU 존재를 확인한 후, stale PG를 제거하고 새 PG를 생성한다.
+**해결**: stale placement group을 감지하여 자동으로 정리하는 패치를 작성했다. `ray.cluster_resources()`로 클러스터 전체의 GPU 존재를 확인한 후, stale PG를 제거하고 새 PG를 생성한다. 이 패치는 `fix-ray-gpu-check`라는 이름의 mod로 launch-cluster.sh에 통합했다.
 
 ### 버그 2: systemd 서비스의 이중 실행
 
@@ -165,7 +227,20 @@ PID 4987 vllm serve ... --gpu-memory-utilization-gb 100  # systemd 재시작
 PID 5477 vllm serve ... --gpu-memory-utilization-gb 100  # systemd 재시작
 ```
 
-**해결**: systemd 서비스 타입을 `Type=forking`에서 `Type=oneshot` + `RemainAfterExit=yes`로 변경했다. `launch-cluster.sh`의 daemon 모드(`-d`)가 프로세스를 백그라운드로 실행하고 즉시 종료하므로, `Type=forking`에서는 systemd가 "프로세스 종료 = 실패"로 판단하고 ExecStop을 실행하는 문제가 있었다.
+**해결**: systemd 서비스 타입을 `Type=forking`에서 `Type=oneshot` + `RemainAfterExit=yes`로 변경했다.
+
+여기서 systemd의 서비스 타입이 왜 중요한지 짚고 넘어가자:
+
+| Type | 동작 방식 | 적합한 경우 |
+|------|----------|------------|
+| `simple` | ExecStart로 지정한 프로세스가 **메인 프로세스**다. 이 프로세스가 종료되면 systemd는 서비스가 중단된 것으로 판단한다 | 프로세스가 포그라운드에서 계속 실행되는 경우 (예: `nginx`, `node server.js`) |
+| `forking` | ExecStart 프로세스가 **자식 프로세스를 fork**하고 부모는 종료된다. systemd는 fork된 자식을 메인 프로세스로 추적한다 | 전통적인 데몬 (예: `sshd`, `apache2`) |
+| `oneshot` | ExecStart가 **한 번 실행되고 종료**된다. `RemainAfterExit=yes`와 함께 사용하면, 프로세스가 종료되어도 서비스를 "active" 상태로 유지한다 | 초기화 스크립트, 일회성 설정 작업 |
+
+`launch-cluster.sh -d`는 컨테이너 내부에서 `docker exec -d`로 vLLM을 백그라운드 실행하고 **즉시 종료**한다. 이때:
+- `Type=forking`이면: 부모 프로세스(launch-cluster.sh)가 종료되었으나 fork된 자식이 없으므로 systemd가 "실패"로 판단 → ExecStop 실행 → 서비스 중지
+- `Type=simple`이면: 메인 프로세스가 종료되었으므로 역시 "중지"로 판단 → Restart=on-failure 작동 → 무한 재시작
+- `Type=oneshot` + `RemainAfterExit=yes`면: 스크립트 정상 종료(exit 0) 후 서비스를 "active" 상태로 유지 → 재시작 없음
 
 ### 버그 3: 커널/드라이버 업그레이드에 의한 메모리 관리 변경
 
@@ -209,12 +284,12 @@ DGX Spark의 GRUB 메뉴는 submenu 구조로 되어 있어, 단순히 `GRUB_DEF
 
 ```bash
 # 228 서버 (UUID: 66606008...)
-sudo grub-set-default "gnulinux-advanced-66606008-dea0-411b-af5c-57cf309f17ba>gnulinux-6.17.0-1008-nvidia-advanced-66606008-dea0-411b-af5c-57cf309f17ba"
+sudo grub-set-default "gnulinux-advanced-66606008-...>gnulinux-6.17.0-1008-nvidia-advanced-66606008-..."
 sudo sed -i "s/GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/" /etc/default/grub
 sudo update-grub
 
-# 237 서버 (UUID: 08692ac5...) -- UUID가 다르므로 주의
-sudo grub-set-default "gnulinux-advanced-08692ac5-dcae-44b9-a866-d0f89a6dea03>gnulinux-6.17.0-1008-nvidia-advanced-08692ac5-dcae-44b9-a866-d0f89a6dea03"
+# 237 서버 (UUID: 08692ac5...) -- 디스크 UUID가 다르므로 주의
+sudo grub-set-default "gnulinux-advanced-08692ac5-...>gnulinux-6.17.0-1008-nvidia-advanced-08692ac5-..."
 sudo sed -i "s/GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/" /etc/default/grub
 sudo update-grub
 ```
@@ -283,7 +358,7 @@ sudo apt-mark hold nvidia-driver-580-open libnvidia-compute-580 \
 
 ### 2. systemd 서비스 설계 시 프로세스 라이프사이클 이해
 
-`launch-cluster.sh -d`처럼 daemon 모드로 프로세스를 백그라운드에 띄우고 즉시 종료하는 스크립트는, systemd의 `Type=forking`이나 `Type=simple`과 궁합이 맞지 않는다. `Type=oneshot` + `RemainAfterExit=yes`가 적합하다.
+`launch-cluster.sh -d`처럼 daemon 모드로 프로세스를 백그라운드에 띄우고 즉시 종료하는 스크립트에는 `Type=oneshot` + `RemainAfterExit=yes`가 적합하다. 앞서 설명한 것처럼 `Type=forking`이나 `Type=simple`은 이런 패턴의 스크립트와 궁합이 맞지 않아 의도치 않은 재시작이나 서비스 중지를 유발한다.
 
 또한 `Restart=on-failure`는 편리하지만, 실패 원인이 리소스 경합(placement group 충돌 등)인 경우 오히려 상황을 악화시킨다. 재시작 간격(`RestartSec`)을 충분히 길게 설정하거나, 재시작 전 정리 로직을 추가해야 한다.
 
@@ -302,9 +377,26 @@ sudo apt-mark hold nvidia-driver-580-open libnvidia-compute-580 \
 
 커널 롤백은 임시 조치다. 이전 커널(6.17.0-1008)은 보안 패치가 중단될 수 있고, 새 커널에서 제공하는 성능 개선이나 하드웨어 지원을 활용하지 못한다.
 
-장기적으로는:
+### 단기: 새 커널 호환성 확보
+
 - 새 커널에서 `--gpu-memory-utilization-gb` 값을 높이거나 `--enforce-eager` 조합으로 262K 컨텍스트를 확보하는 방법을 계속 탐색
 - vLLM 업스트림에 DGX Spark UMA 환경에서의 placement group 이슈를 보고
 - NVIDIA 드라이버 580.142에서의 UMA 메모리 할당 변경사항을 추적
+
+### 중장기: TurboQuant를 통한 KV 캐시 메모리 혁신
+
+이번 장애의 본질적 원인은 **397B 모델 가중치가 GPU 메모리의 대부분을 차지하여 KV 캐시에 할당할 여유가 부족**하다는 것이다. FP8 KV 캐시로 2배의 효율을 얻었지만, 262K 컨텍스트에서는 여전히 빠듯하다.
+
+[TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)는 Google이 ICLR 2026에서 발표한 KV 캐시 압축 알고리즘으로, 이 문제에 대한 근본적인 해법이 될 수 있다:
+
+- **KV 캐시를 3-bit(Key) + 2-bit(Value)로 극단적 압축**: FP8(8-bit) 대비 약 3배 추가 절약, FP16 대비 약 **6배** 메모리 절약
+- **학습/파인튜닝 불필요**: 추론 시점에 KV 캐시에만 적용하므로 기존 모델을 그대로 사용
+- **정밀도 유지**: PolarQuant(극좌표 변환)와 QJL(1-bit 오차 보정) 두 단계로 압축하여, 일부 벤치마크에서 full-precision과 동등한 성능
+
+현재 FP8 KV 캐시로 262K 컨텍스트에 ~12GB를 사용하고 있는데, TurboQuant를 적용하면 동일 메모리에서 이론적으로 **~750K+ 컨텍스트**가 가능해진다. 또는 동일 컨텍스트에서 더 많은 동시 요청을 처리할 수 있다.
+
+vLLM에는 아직 공식 통합되지 않았으나([관련 이슈](https://github.com/vllm-project/vllm/issues/38171)), Google의 공식 구현이 2026년 Q2에 공개될 예정이며, 독립 개발자들의 Triton 커널 기반 구현도 이미 존재한다. TurboQuant + vLLM 조합은 DGX Spark처럼 메모리가 제한된 환경에서 초거대 모델을 서빙하면서도 충분한 컨텍스트를 확보하는 핵심 기술이 될 것이다.
+
+---
 
 현재 구성은 안정적으로 동작하고 있으며, AI 코딩 에이전트들(Claude Code, OpenClaw, Antigravity)이 397B 모델을 262K 컨텍스트로 활용하고 있다.
