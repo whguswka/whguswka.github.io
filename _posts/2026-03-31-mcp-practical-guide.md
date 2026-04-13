@@ -15,11 +15,21 @@ toc_sticky: true
 
 ## 들어가며
 
-[멀티 에이전트 운영기](/development/multi-agent-orchestration/)에서 Agent Task Hub(ATH)를 소개했다. ATH에는 REST API가 있고, AI 에이전트들은 CLI(`ath` 명령)를 통해 이 API를 호출한다. 그런데 CLI 방식에는 한계가 있었다.
+[멀티 에이전트 운영기](/development/multi-agent-orchestration/)에서 Agent Task Hub(ATH)를 소개했다. ATH에는 REST API가 있고, AI 에이전트들은 CLI(`ath` 명령)를 통해 이 API를 호출한다. CLI는 셸 스크립트 자동화, 파이프라인 연계, SSH 환경에서의 가벼운 사용에 적합하다. 지금도 일부 에이전트는 CLI를 기본 인터페이스로 사용하고 있다.
 
-에이전트가 `bash` 도구로 `ath task create --title "..."` 명령을 실행하면, 셸 호출 → 스크립트 실행 → HTTP 요청 → 응답 파싱이라는 경로를 거친다. 에러 발생 시 어디서 문제가 생겼는지 디버깅이 어렵고, 에이전트가 HTTP 상태 코드를 해석하지 못하는 경우도 있었다.
+그러나 에이전트가 CLI를 호출하는 과정에서 구조적인 한계가 드러났다. 에이전트가 `bash` 도구로 `ath task create --title "..."` 명령을 실행하면, 셸 호출 → 스크립트 실행 → HTTP 요청 → 응답 파싱이라는 경로를 거친다. 이 경로의 어디에서든 문제가 생길 수 있고, 에이전트 입장에서는 셸의 exit code와 stdout 문자열을 직접 해석해야 한다. 제목에 특수문자가 포함되면 셸 이스케이핑이 깨지고, 응답 JSON을 제대로 파싱하지 못하는 에이전트도 있었다.
 
-이 문제를 해결한 것이 **MCP(Model Context Protocol)**다. MCP 서버를 만들면 에이전트가 ATH의 기능을 네이티브 도구(tool)로 직접 사용할 수 있다. `ath_task_create`가 `grep`이나 `file_read`와 동일한 레벨의 도구가 되는 것이다.
+핵심적인 차이는 **도구 발견(discovery)** 문제다. CLI 방식에서는 에이전트의 규칙 파일(GEMINI.md, CLAUDE.md 등)에 "이 CLI를 이렇게 호출하라"고 일일이 기술해야 한다. 규칙 파일이 바뀌면 모든 에이전트의 규칙을 동시에 갱신해야 하고, 에이전트가 규칙을 참조하지 않으면 도구의 존재 자체를 알 수 없다.
+
+이 문제를 해결한 것이 **MCP(Model Context Protocol)**다. MCP 서버를 만들면 에이전트가 ATH의 기능을 네이티브 도구(tool)로 직접 사용할 수 있다. `ath_task_create`가 `grep`이나 `file_read`와 동일한 레벨의 도구가 되는 것이다. 서버가 도구 목록과 파라미터 스키마를 자동으로 노출하므로, 에이전트는 별도 규칙 없이도 사용 가능한 도구를 인식한다.
+
+정리하면, ATH는 CLI와 MCP를 이중 인터페이스로 제공한다:
+
+| | CLI (`ath` 명령) | MCP (네이티브 도구) |
+|---|---|---|
+| **강점** | 셸 스크립트 연계, SSH 환경 | 구조화된 에러 처리, 도구 자동 발견 |
+| **약점** | 셸 이스케이핑, 응답 파싱 | MCP 미지원 클라이언트에서 사용 불가 |
+| **사용 에이전트** | OpenClaw (워크플로우 기반) | Antigravity, Claude Code, OpenCode |
 
 이 글에서는 MCP의 핵심 개념을 짧게 정리하고, 실제로 두 개의 MCP 서버를 구현한 과정과 운영 경험을 다룬다.
 
@@ -69,7 +79,9 @@ MCP는 두 가지 전송 방식을 지원한다:
 | **SSE** (Server-Sent Events) | HTTP GET(스트림) + POST(메시지) | Claude Code |
 | **StreamableHTTP** | HTTP POST 기반 세션형 전송 | Antigravity, OpenCode |
 
-같은 MCP 서버에서 두 방식을 동시에 제공해야 한다. Claude Code는 SSE만 지원하고, Antigravity와 OpenCode는 StreamableHTTP을 사용하기 때문이다. 이 점이 구현에서 가장 까다로웠던 부분이다.
+같은 MCP 서버에서 두 방식을 동시에 제공해야 한다. Claude Code는 SSE만 지원하고, Antigravity와 OpenCode는 StreamableHTTP을 사용하기 때문이다.
+
+두 방식을 별도 서버로 분리하는 방법도 있었으나, 그렇게 하면 서버가 2배로 늘어 포트 관리, 배포 파이프라인, 헬스체크가 모두 이중으로 필요해진다. ATH MCP와 Service Portal MCP를 합하면 4개 서버가 되는 셈이다. 단일 서버에서 경로(`/sse`, `/mcp`)로 분기하면 배포 단위는 하나로 유지되면서 두 클라이언트를 모두 지원할 수 있다. 운영 복잡도를 줄이기 위해 듀얼 트랜스포트를 선택했다.
 
 ---
 
@@ -109,7 +121,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 
-const ATH_API = process.env.ATH_API_URL ?? "http://localhost:30880";
+const ATH_API = process.env.ATH_API_URL ?? "http://localhost:<ath-port>";
 
 // ATH REST API 호출 헬퍼
 async function athFetch(method: string, path: string, body?: unknown) {
@@ -274,10 +286,10 @@ ATH MCP는 TypeScript인데 Service Portal MCP는 순수 JavaScript로 작성했
 {
   "mcpServers": {
     "ath": {
-      "url": "http://192.168.0.156:30881/mcp"
+      "url": "http://<server-ip>:<ath-mcp-port>/mcp"
     },
     "service-portal": {
-      "url": "http://192.168.0.156:30882/mcp"
+      "url": "http://<server-ip>:<portal-mcp-port>/mcp"
     }
   }
 }
@@ -293,10 +305,10 @@ SSE 엔드포인트를 사용:
 {
   "mcpServers": {
     "ath": {
-      "url": "http://192.168.0.156:30881/sse"
+      "url": "http://<server-ip>:<ath-mcp-port>/sse"
     },
     "service-portal": {
-      "url": "http://192.168.0.156:30882/sse"
+      "url": "http://<server-ip>:<portal-mcp-port>/sse"
     }
   }
 }
@@ -307,11 +319,11 @@ SSE 엔드포인트를 사용:
 MCP 서버에 health check 엔드포인트를 구현해두었다:
 
 ```bash
-$ curl -s http://192.168.0.156:30881/health | jq
+$ curl -s http://<server-ip>:<ath-mcp-port>/health | jq
 {
   "status": "ok",
   "service": "ath-mcp",
-  "ath_api": "http://localhost:30880",
+  "ath_api": "http://localhost:<ath-port>",
   "sse_sessions": 1,
   "http_sessions": 2
 }
@@ -321,9 +333,11 @@ $ curl -s http://192.168.0.156:30881/health | jq
 
 ## 실전에서의 MCP 사용 패턴
 
-### 에이전트가 MCP 도구를 사용하는 과정
+### 에이전트가 ATH 도구를 사용하는 과정
 
-에이전트 관점에서 MCP 도구는 시스템 도구(파일 읽기, 터미널 실행)와 동일하게 취급된다. 예를 들어 Antigravity가 작업을 시작할 때:
+에이전트마다 ATH에 접근하는 방식이 다르다. MCP를 사용하는 에이전트와 CLI를 사용하는 에이전트의 실제 흐름을 비교하면 다음과 같다.
+
+**Antigravity (MCP 방식)**:
 
 ```
 사용자: "PostgreSQL 백업 스크립트를 만들어줘"
@@ -335,14 +349,31 @@ Antigravity의 내부 처리:
 4. ath_task_update(task_id, status="completed") 호출
 ```
 
-CLI 방식과 비교했을 때의 차이:
+**OpenClaw (CLI 방식)**:
+
+```
+사용자: (디스코드에서) "PostgreSQL 백업 스크립트를 만들어줘"
+
+OpenClaw의 내부 처리:
+1. bash 도구로 `ath task create --title "PostgreSQL 백업 스크립트 작성" --agent openclaw-mac` 실행
+   → stdout에서 Task ID 파싱
+2. bash 도구로 `ath knowledge search "PostgreSQL backup"` 실행
+   → stdout JSON 파싱하여 관련 지식 확인
+3. 파일 생성, 코드 작성
+4. bash 도구로 `ath task update <task-id> --status completed --summary "..."` 실행
+```
+
+OpenClaw이 CLI를 사용하는 이유는, 워크플로우 기반 실행 구조에서 셸 명령이 기본 인터페이스이기 때문이다. MCP 클라이언트를 내장하지 않는 환경에서는 CLI가 유일한 선택지다.
+
+두 방식의 차이:
 
 | 항목 | CLI 방식 | MCP 방식 |
 |------|---------|----------|
-| 호출 경로 | bash → curl → HTTP | 도구 직접 호출 |
-| 에러 처리 | 셸 exit code 해석 필요 | SDK 레벨 에러 전파 |
-| 파라미터 | 문자열 조합 | 구조화된 JSON |
+| 호출 경로 | bash → 셸 스크립트 → HTTP | 도구 직접 호출 |
+| 에러 처리 | 셸 exit code + stdout 해석 | SDK 레벨 에러 전파 |
+| 파라미터 | 문자열 조합 (이스케이핑 주의) | 구조화된 JSON |
 | 도구 발견 | 규칙 파일에 명시 필요 | 서버가 자동 노출 |
+| 셸 특수문자 | 깨질 수 있음 | 영향 없음 |
 
 ### MCP로 해결한 실제 문제
 
