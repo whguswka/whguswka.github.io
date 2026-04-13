@@ -32,7 +32,7 @@ toc_sticky: true
 
 ```mermaid
 graph LR
-    DEV[개발자 / AI 에이전트] -->|git push| GL[GitLab CE<br/>192.168.0.156:31085]
+    DEV[개발자 / AI 에이전트] -->|git push| GL[GitLab CE<br/><server-ip>:<gitlab-port>]
     GL -->|trigger| GR[GitLab Runner<br/>K8s Executor]
 
     subgraph Pipeline["CI/CD Pipeline"]
