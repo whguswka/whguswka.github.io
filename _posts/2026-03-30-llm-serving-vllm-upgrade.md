@@ -1,6 +1,6 @@
 ---
-title: "LLM 서빙 인프라 (3) — vLLM 0.19.0 시대의 서빙 경험과 커널 롤백"
-excerpt: "초거대 언어 모델인 Qwen3.5-397B를 262K 컨텍스트로 서빙하기 위한 vLLM의 FP8 KV 캐시 및 절대 메모리 할당 패치 적용 사례를 다룹니다. 이 과정에서 발생한 시스템 자원 경합 및 메모리 한계로 인한 커널 롤백 문제를 분석합니다."
+title: "LLM 서빙 인프라 (3) — vLLM 0.18 업그레이드, Qwen3.5-397B 서빙, 그리고 커널 롤백"
+excerpt: "vLLM 0.18의 FP8 KV 캐시와 절대 메모리 할당 패치로 Qwen3.5-397B 262K 서빙에 성공했다. 하지만 커널/드라이버 업데이트로 장애가 발생했고, Ray placement group·systemd·메모리 문제를 추적한 끝에 커널 롤백으로 복구했다."
 categories:
   - Infrastructure
 tags:
@@ -18,147 +18,461 @@ toc_sticky: true
 
 ## 개요
 
-[이전 글](/infrastructure/llm-serving-models/)에서 다양한 모델을 거쳐 Qwen3.5-122B-FP8 환경으로 정착하기까지의 모델 전환 여정을 다루었습니다. 이번 글은 그 이후의 이야기입니다.
+[이전 글](/infrastructure/llm-serving-models/)에서 Qwen3-235B부터 MiniMax-M2.5를 거쳐 Qwen3.5-122B-FP8로 돌아오기까지의 모델 전환 여정을 다뤘다. 이 글은 그 이후의 이야기다.
 
-최근 vLLM[^vllm]의 시스템 업데이트를 거치며, 이전에는 메모리 한계로 올릴 수 없었던 초거대 모델인 **Qwen3.5-397B**(전문가 혼합형 구조, 17B 활성, INT4 양자화) 모델을 무려 262,144(262K) 토큰이라는 방대한 문맥 크기로 서비스하는 데 성공했습니다. 하지만 같은 날 시스템 내부 패키지를 업데이트하면서 서비스가 완전히 불가능해지는 장애를 겪었고, 운영체제의 핵심인 커널을 이전 버전으로 되돌려(롤백) 겨우 복구할 수 있었습니다.
+vLLM 0.18로 업그레이드하면서 이전에는 올릴 수 없었던 **Qwen3.5-397B**(MoE, 17B 활성, INT4) 모델을 262K 컨텍스트로 서빙하는 데 성공했다. 하지만 같은 날 시스템 패키지 업데이트(apt upgrade)로 인해 서빙이 완전히 불가능해지는 장애를 겪었고, 커널 롤백으로 복구했다.
 
-이 글에서는 다음 세 가지를 다룹니다:
+이 글에서는 세 가지를 다룬다:
 
-1. vLLM의 어떤 최신 기능이 초거대 모델 서빙을 가능하게 만들었는가
-2. 단순한 시스템 업데이트가 왜 인공지능 모델 서빙을 망가뜨렸는가
-3. 장애 원인을 파악하는 과정에서 드러난 시스템 조합의 문제와 대응 방법
-
----
-
-## 397B 모델을 시도한 이유
-
-기존 운영 모델은 단순 응답 속도 측면에서는 유리했으나, 복잡한 다중 파일 로직 수정 및 컴포넌트 간 아키텍처 설계를 수행하는 코드 에이전트의 워크로드를 감당하기에는 추론(Reasoning) 성능의 한계가 관찰되었습니다. 따라서 파라미터 규모를 대폭 확장한 거대 언어 모델 도입을 추진했습니다.
-
-Qwen3.5-397B 모델은 전체 3970억 개의 파라미터 중 한 번의 응답에 170억 개(17B)만 선택적으로 활성화되는 MoE(Mixture of Experts)[^moe] 구조 시스템입니다. 여기에 INT4 양자화 스펙을 적용하여 모델의 물리 용량을 약 100GB 수준으로 최적화시켜, 전체 가용 인프라 VRAM(약 240GB)으로 수용할 수 있는 논리적 기반을 확보했습니다.
-
-그러나 모델 가중치(Weights) 적재만으로 정상적인 서빙이 보장되지는 않습니다. VRAM 약 100GB를 가중치 적재에 소모할 경우, 사용자 요청에 대응하기 위한 KV 캐시(KV Cache)[^kv-cache] 공간이 물리적으로 턱 없이 부족하여, 기존 컨텍스트 윈도우 스키마로는 모델 서비스 환경 기동이 제한되었습니다.
+1. vLLM 0.18의 어떤 기능이 397B 서빙을 가능하게 했는가
+2. 커널 업데이트가 왜 LLM 서빙을 망가뜨렸는가
+3. 디버깅 과정에서 드러난 vLLM v1/Ray 조합의 운영상 문제와 대응
 
 ---
 
-## vLLM 시스템의 발전 -- 무엇이 달라졌는가
+## 왜 397B를 올리고 싶었는가
 
-### FP8 KV 캐시의 도입
+이전 글에서 언급했듯이, 122B-FP8(활성 10B)은 안정적이었지만 코딩 에이전트로서의 역량에 한계가 있었다. 복잡한 멀티파일 리팩터링이나 아키텍처 설계 같은 작업에서는 모델 규모의 벽이 느껴졌다.
 
-200B+ 스케일 모델의 서빙을 물리적으로 가능하게 만든 결정적 요소는 **FP8 KV 캐시**[^fp8] 양자화(Quantization) 기술의 최적화입니다.
+Qwen3.5-397B-A17B는 MoE 구조로 전체 397B 파라미터 중 요청당 17B만 활성화된다. INT4(AutoRound) 양자화를 적용하면 모델 가중치는 대략 100GB 수준으로, DGX Spark 2노드(~240GB)에 올라갈 수 있는 크기다.
 
-KV 캐시는 어텐션(Attention) 연산 과정의 중간 상태를 보관하는 메모리 버퍼 레이어입니다. 컨텍스트 길이가 길어지거나 동시 발생 요청(Concurrent Requests)이 증가함에 따라 선형적으로 막대한 VRAM 점유를 야기합니다.
-
-| 단계 | 토큰당 메모리 사용량 | 컨텍스트 유지 가능성 대비 효과 |
-|------|-------------|----------------------|
-| 기존 기술 (FP16) | 기준점 | 기준점 |
-| 정밀 압축 기술 (FP8) | **사용량 약 50% 절감** | **물리 컨텍스트 2배 확장** |
-
-VRAM 프로파일링 결과 가중치 적재 후 잔여 12GB를 KV 캐시에 할당할 수 있었으며, 기존 FP16 포맷 대비 양자화율을 극대화한 FP8 포맷 스펙을 도입함으로써 동일 GPU 사이클 내에서 컨텍스트 처리 보존 한도를 2배 증가시켰습니다.
-
-### 메모리 절대 용량 할당 패치 적용
-
-초기 vLLM 메모리 할당 전략은 전체 VRAM 대비 백분율(Fraction)로 제어되었습니다. 그러나 병렬 처리 클러스터 환경 및 시스템 상주 프로세스를 혼용하는 복합 인프라 환경에서는, 백분율 설정의 불확실성이 발생하여 정확한 메모리 임계점(OOM Point) 산출에 오차가 동반되었습니다.
-
-이를 해결하기 위해 커뮤니티 컨트리뷰션을 수렴하여 시스템 프리셋을 절대 물리 용량 단위(GB 단위)로 매니페스트에 고정하는 커스텀 패치를 병행 적용했습니다.
-
-총 128GB 물리 VRAM 스펙 내에서 112GB를 vLLM 워커 프로세스에 엄격 제한(Hard limit)하고:
-- 파라미터 가중치 레이어 적재: 약 100GB
-- KV 캐시 전용 버퍼: 약 12GB
-- 인프라 백그라운드 프로세스 잔여분: 약 16GB
-
-해당 설정값을 지속적으로 프로파일링 및 튜닝한 결과, 마침내 최대 262K(262,144) 토큰 컨텍스트 길이의 서빙 공간을 안정적으로 매핑할 수 있었습니다.
-
-### 분산 추론 프로세스 병렬화
-
-200B 이상의 가중치 볼륨은 단일 인스턴스의 물리적인 제한으로 수용이 불가능하므로, 텐서 병렬화(Tensor Parallelism)를 통해 다중 GPU 인스턴스를 하나로 바인딩하여 런타임을 구성합니다. 향상된 분산 프레임워크들의 적용으로 I/O 바운드 지그스루가 개선되었으나, 멀티 노드 파이프라인의 물리적 종속성 증가로 인해 오류 발생 시 트러블슈팅의 심도가 높아진다는 트레이드오프가 존재했습니다.
+문제는 "올라갈 수 있다"와 "서빙할 수 있다"는 다르다는 것이었다. 모델 가중치 100GB를 적재하고 나면 KV 캐시에 할당할 메모리가 거의 남지 않았다. 이전 vLLM 버전에서는 이 조합이 불가능했다.
 
 ---
 
-## 초기 배포 성공 및 커널 업데이트 장애 발생
+## vLLM 0.18 -- 무엇이 달라졌는가
 
-### 배포 파이프라인 검증
+### FP8 KV 캐시
 
-파라미터 증분 테스트 및 VRAM 할당 스크립트 반영 후 인스턴스를 재기동하였으며, 가중치 로딩 및 CUDAGraph 최적화를 포함한 약 12분의 콜드 부트 후 정상 서빙 레이어가 확보되었습니다.
+vLLM 0.18의 가장 중요한 변경점은 **FP8 KV 캐시**의 안정화다. 이전 버전에서도 FP8 KV 캐시를 지원했지만, 0.18에서 Blackwell 아키텍처(GB10)에 대한 호환성이 개선되었다.
 
-에이전트를 통하여 도구 호출(Tool Calling) 시나리오 검증 시 기대 목표 스펙을 월등히 상회하는 논리 구조화 능력 및 복합 워크플로우 정상 동작 결과를 확인했습니다.
+KV 캐시는 추론 시 각 토큰의 Key/Value 텐서를 저장하는 공간이다. 컨텍스트가 길어질수록, 동시 요청이 많아질수록 KV 캐시는 더 많은 메모리를 소비한다.
 
-### 시스템 업데이트 종속성 충돌
+| KV 캐시 dtype | 토큰당 메모리 | 동일 메모리 대비 컨텍스트 |
+|--------------|-------------|----------------------|
+| FP16 | 기준 | 기준 |
+| FP8 | **50%** | **2배** |
 
-초기 로드 검증 직후 인프라 내부 정례 보안 패치와 기반 패키지의 마이너 버전 판올림을 일괄 수행했습니다. 이 절차 상에서 GPU 런타임 드라이버와 리눅스 커널 모듈 의존성이 동시에 변경되는 트리거가 발생했습니다.
+> 실제 확보 가능한 컨텍스트 증가는 모델 구조와 구현 세부사항에 따라 다르지만, FP8 KV 캐시는 FP16 대비 KV 캐시 메모리를 대체로 절반 수준으로 줄여준다.
 
-재부팅(Reboot) 단계에서 물리적 PCI 버스 상 장치 점유는 확인되었으나, vLLM 워커 클러스터 시스템은 'GPU Unavailable' 디텍션 스택 트레이스 폴트(Fault) 로그를 반환하여 기동 불가(Crash Loop) 상태에 빠졌습니다. 이를 추적하는 디버깅 작업이 6시간가량 소요되었습니다.
+모델 가중치 100GB를 적재한 후 남는 ~12GB에서, FP16이었다면 짧은 컨텍스트만 가능했겠지만 FP8 KV 캐시 덕분에 2배의 컨텍스트를 확보할 수 있었다.
 
----
+```bash
+--kv-cache-dtype fp8  # FP8 KV 캐시 활성화
+```
 
-## 장애의 원인 분석 -- 3중으로 꼬인 문제
+### gpu-memory-utilization-gb
 
-이번 서비스 중단은 단순한 소프트웨어 오류 하나가 아닌 시스템 아키텍처 내부의 3가지 결함 상태가 연동된 복합 장애 케이스였습니다.
+기존 vLLM의 `--gpu-memory-utilization` 파라미터는 비율(0.0~1.0)로 GPU 메모리 사용량을 지정한다. 예를 들어 `0.90`은 "전체 GPU 메모리의 90%를 사용하겠다"는 의미다.
 
-1. **커널 및 런타임 드라이버 업그레이드**: GPU 내부 매핑(Mapping) 메모리 할당 단위 변경 및 오버헤드 유발
-2. **가용 자원 데드락(Deadlock)**: 상태 불일치(Stale)에 의한 시스템 자원의 텐서 분산 처리 점유 폴트
-3. **Systemd 무한 재시작 루프**: 자동 복구(Auto-Restart) 지침이 유발한 스파이크 부하 증상
+DGX Spark의 UMA(통합 메모리) 환경에서 이것은 문제가 된다. `nvidia-smi`가 VRAM을 `N/A`로 보고하므로, vLLM이 "전체 GPU 메모리"를 정확히 파악하지 못할 수 있다. 비율 기반 설정은 환경에 따라 예측 불가능한 결과를 낳는다.
 
-### 첫 번째 결함 요인: 자원 레이스 컨디션 및 데드락
+공식 vLLM 기능은 아니지만, DGX Spark용 커뮤니티 프로젝트([spark-vllm-docker](https://github.com/eugr/spark-vllm-docker))에서 제공하는 `--gpu-memory-utilization-gb` 파라미터는 **절대값(GiB)**으로 메모리 사용량을 지정한다:
 
-VRAM 할당 단계의 폴트는 레이스 컨디션(Race Condition)[^race-condition] 형태의 자원 상태 버그에서 기인했습니다. 
-이전 실행 사이클의 종료 시그널이 정리되지 않은 채 락(Lock) 해제 모듈(Cleanup)이 누락되면서, 차기 구동된 런타임 프로세스는 시스템 버스 상 가용 자원이 존재하지 않는 것(0)으로 역산하는 오류가 발생했습니다.
+```bash
+--gpu-memory-utilization-gb 112  # 정확히 112GB 사용
+```
 
-**대응 전략**: 시스템 프로세스 Init 스텝 단축 스크립트를 삽입, 자원 점유 찌꺼기 상태(Stale Lock)를 스캔하여 강제로 권한 락 초기화(Force Cleanup)한 뒤 GPU 인스턴스에 재배치하는 진입 로직을 확보했습니다.
+DGX Spark의 물리 메모리 128GB 중 112GB를 GPU 예산으로 잡으면, 개념적으로는 다음처럼 나뉜다:
+- 시스템/런타임이 건드리지 않아야 할 여유: ~16GB
+- vLLM이 실제로 사용할 수 있는 GPU 메모리 예산: 112GB
+- 그 안에서 모델 가중치 적재: ~100GB
+- 남는 KV 캐시 예산: ~12GB (FP8)
 
-### 두 번째 결함 요인: 자동 재시작 정책 충돌
+이때 핵심은 **262K 컨텍스트가 모델 가중치 100GB만으로 결정되는 것이 아니라, 남은 KV 캐시 예산이 약 12GB 확보되느냐에 달려 있었다**는 점이다. 같은 모델이라도 KV 캐시 예산이 줄어들면 유지 가능한 최대 컨텍스트 길이도 함께 줄어든다. 비율 기반(`0.90`)이었다면 "128GB의 90% = 115GB"인지, "감지된 값의 90%"인지 불확실했을 것이다.
 
-서비스 데몬(Systemd) 매니페스트에 정의된 'Restart=on-failure' 옵션과 30초 대기(Delay) 타이머 설정이 오동작을 과중시켰습니다. 자원 경쟁 상태로 프로세싱이 중단될 때 셸 타임아웃 이전에 지속적인 백그라운드 포크(Fork) 트리거가 발생했습니다.
+> 참고: `gpu-memory-utilization-gb` 파라미터는 vLLM 공식 빌드에는 포함되어 있지 않다. DGX Spark 전용 커뮤니티 프로젝트([spark-vllm-docker](https://github.com/eugr/spark-vllm-docker))에서 mod(패치) 시스템을 통해 제공하는 기능이다.
 
-추가적인 수동 디버깅 명령 입력 과정과 자동 재시작이 동일 선상에서 겹치며 물리 시스템 내 최대 6개의 이중화된 분산 워커 클러스터가 충돌 루프를 반복하는 상황이 초래되었습니다.
+### v1 엔진 아키텍처
 
-**대응 전략**: Systemd의 Exec 프로세스 관리 타입을 변경하고, 자동화 재시도 파라미터를 비활성화 처리하여 매니페스트 설정값을 보수적 환경 스펙으로 하향 동기화했습니다.
+vLLM 0.18은 **v1 엔진**이 기본값이다. v0 엔진과의 주요 차이:
 
-### 세 번째 결함 요인: VRAM 공간 단편화 및 할당 초과
+- **APIServer와 EngineCore 분리**: APIServer는 HTTP 요청을 처리하고, EngineCore는 별도 프로세스(multiprocessing)로 실행되어 실제 추론을 담당한다
+- **SchedulerOutput 최적화**: 청크 프리필(chunked prefill)과 prefix caching이 개선되었다
+- **Compiled DAG 지원**: Ray를 통한 분산 실행 시 컴파일된 DAG로 오버헤드를 줄인다
 
-런타임 데드락 루프 현상을 통제한 이후 논리 점검 단계에서 VRAM 인계 로직의 OOM(Out of Memory) 스택 트레이스 정보가 확인되었습니다.
+이 구조는 성능상 이점이 있었지만, 프로세스와 리소스 상태가 꼬였을 때 원인 파악을 더 어렵게 만들었다.
 
-하드 리밋을 12GB 여유 수치로 설정했음에도 불구하고, KV 캐시 블록 할당 프로파일링 중 공간 가용 마진이 네거티브 수치(음수)로 스캔되는 오류 시그널이 발견되었습니다. 이는 당일 패치 배포한 커널 및 GPU 드라이버 판올림 릴리스가 유발한 시스템 레벨 사이드 이펙트입니다.
+### 분산 추론 백엔드: Ray
 
-드라이버 업데이트 이후 GPU 내부의 페이지 매핑 처리 오버헤드가 상승하여 동급의 파라미터 구조체 적재 시 메모리 점유 마진 체적이 커졌습니다. 기존 드라이버에서 100GB 수준의 메모리 상용성을 보였으나 실제 환경에선 104GB 수준으로 부피가 증가하였으며, 이는 가용 인프라가 버틸 수 있는 한계 스펙을 상회하여 메모리 임계점 파단(Fault) 스크래치를 내게 되었습니다.
+DGX Spark 2노드로 397B 모델을 서빙하려면 **Tensor Parallelism(TP)**이 필수다. 하나의 GPU에 모델 전체를 올릴 수 없으므로, 모델 가중치를 2개 GPU에 분할하고 추론 시 AllReduce로 동기화해야 한다.
 
-VRAM 릭/점유 상승 증상을 상쇄하기 위해서는 KV 캐시를 위한 최대 컨텍스트 윈도우 여유를 기존 262K에서 불과 32K 수준으로 삭감해야만 초기 부트 프로비저닝을 안정권(Safe-zone)에서 통과할 수 있었습니다. 이는 파라미터 스케일링의 가장 중요한 아키텍처 목적 자체를 원천적으로 훼손하는 다운그레이드 조치였습니다.
+vLLM은 이를 위해 [Ray](https://docs.ray.io/)를 분산 실행 백엔드로 사용한다. Ray는 Python 기반 분산 컴퓨팅 프레임워크로, 주요 개념은 다음과 같다:
 
----
+- **Ray Cluster**: Head 노드(스케줄러)와 Worker 노드(실행기)로 구성된다. 우리 환경에서는 228이 Head, 237이 Worker다
+- **Placement Group**: GPU, CPU 같은 리소스를 논리적으로 묶어 예약하는 단위다. vLLM은 TP 수만큼의 GPU를 placement group으로 예약하여 다른 프로세스가 사용하지 못하게 보호한다
+- **Actor**: Ray에서 상태를 가진 원격 객체다. vLLM은 각 GPU에서 실행되는 `RayWorkerWrapper`를 Actor로 생성하여 모델 추론을 수행한다
 
-## 트러블슈팅 및 롤백 구성
-
-디버깅 트래킹 상 원인이 시스템 런타임 드라이버 구조 매핑 결함에 있음을 특정하자, 즉시 업데이트 적용 전 리비전으로의 시스템 롤백(Rollback)을 결정했습니다.
-
-부트로더(GRUB)의 GRUB_DEFAULT 인덱스 설정을 변경하여 마이그레이션 이전의 기존 커널 버전(Stable Kernel)으로 강제 프로비저닝하여 디바이스를 재부팅했습니다. 
-
-다운그레이드 직후 OOM 크래시는 완전히 소거되었고 기존 오리지널 스펙 타임라인인 12분 적재 후 KV 캐싱 프로파일링에 의한 262K 대형 컨텍스트 서빙 구동 상태가 정상 복구되었습니다.
-
----
-
-## 에필로그: vLLM 0.19.0 정식 릴리스
-
-이러한 시행착오를 겪던 시점 직후인 2026년 4월 초, 드디어 **vLLM 0.19.0 버전이 정식으로 출시**되었습니다. 
-
-기존 버전에서 병렬 프로세스 모니터링 포인트였던 레이스 컨디션 및 Systemd 경합으로 촉발되었던 분산 메모리 할당 포크(Fork) 버그 포인트가 신규 19.x 버전의 아키텍처 스펙으로 최적화 패치 통합되었습니다. 부트로더 롤백 트릭 등 보조적인 워크어라운드 정책에 기대어 관리하던 서빙 매니페스트 라벨의 불확실성이 제거되고 안정적인 API 궤도 스펙 기반으로 마이그레이션이 성공하게 되었습니다.
+이 구조에서 핵심은 **placement group이 GPU 리소스를 선점·예약하여 다른 워크로드와의 경합을 줄인다**는 점이다. 이것이 나중에 문제가 된다.
 
 ---
 
-## 교훈 및 다음 과제
+## 397B 서빙 성공 -- 그리고 장애
 
-### 코어 종속성 판올림 정책 재수립
+### 첫 서빙 성공
 
-런타임 메인터넌스를 위한 시스템 커널 및 드라이버 코어 업데이트는, 임계점 수준에서 튜닝된 VRAM 오프셋 매핑 시스템 아키텍처에 중대한 크래시를 동반할 잠재 리스크를 내재합니다. 프로덕션 운영 스테이지 전이 상태에서는 인프라 서비스 안정성 유지를 위해 코어 라이브러리 및 커널 시스템 판올림 주기를 보수적인 정책으로 동결 및 일괄 통제해야 한다는 지표를 관측했습니다.
+vLLM 0.18로 업그레이드하고 Qwen3.5-397B-INT4를 올렸다. 약 12분의 시작 시간(모델 로딩 6분 + KV 캐시 프로파일링 + CUDA 그래프 컴파일) 후 서빙이 시작되었다.
 
-### 다음 과제
+```
+vLLM 0.18.1rc1.dev222
+모델: Intel/Qwen3.5-397B-A17B-int4-AutoRound
+컨텍스트: 262,144 tokens (262K)
+KV Cache: FP8
+GPU 메모리: 112GB
+Tensor Parallel: 2 (228 Head + 237 Worker)
+```
 
-클러스터 버전 롤백 처리는 한시적인 커스텀 브리지 정책에 불과하므로, 향후에는 최신 OS 커널 레이어 하에서도 과도한 메모리 단편화 및 할당 이탈 현상 없이 거대 스케일 모델 가중치가 호환될 수 있는 컴파일 프레임워크 최적화 테스트가 진행되어야 합니다.
+OpenClaw(디스코드 봇 에이전트)를 통해 정상 동작을 확인했다. tool calling과 reasoning 모두 정상이었다.
 
-더불어 장기 로드맵 차원에서, KV 캐시 점유 파편화를 더욱 경감시키는 선형적 Attention 매핑 아키텍처 도입이나 타 디바이스 메모리 교환 전략(Offloading) 기반을 확충하여 단일 메모리 인프라 단위에서의 물리 제약 한계를 돌파하는 인프라 고도화 설계가 추진될 예정입니다.
+### apt upgrade -- 장애의 근본적 원인
+
+같은 날 오후, 시스템 패키지 업데이트를 실행했다:
+
+```bash
+sudo apt upgrade
+```
+
+이 명령 하나가 NVIDIA 드라이버와 커널을 모두 업그레이드했다:
+
+| 패키지 | 변경 전 | 변경 후 |
+|--------|--------|--------|
+| nvidia-driver-580-open | 580.126.09 | 580.142 |
+| linux-image-nvidia | 6.17.0-1008 | 6.17.0-1014 |
+| libnvidia-compute-580 | 580.126.09 | 580.142 |
+
+재부팅 후 vLLM 서비스가 자동으로 시작되었지만, API가 응답하지 않았다. `docker logs`를 확인하니:
+
+```
+ValueError: Current node has no GPU available.
+current_node_resource={'accelerator_type:GB10': 1.0, 'CPU': 2.0, ...}
+```
+
+물리 GPU는 인식되는데(accelerator_type:GB10이 보인다), Ray 스케줄러는 사용 가능한 GPU를 0으로 보고하고 있었다. 여기서부터 6시간의 디버깅이 시작됐다.
 
 ---
 
-[^vllm]: vLLM: 대용량 언어 모델을 보다 적은 자원으로 빠르고 효율적으로 동작시키기 위해 개발된 인공지능 추론 전용 엔진.
-[^moe]: MoE (Mixture of Experts): 수많은 신경망 덩어리(전문가)를 만들어 두고, 질문의 종류에 따라 가장 잘 아는 전문 신경망 일부만 켜서 답변하는 효율적인 AI 모델 구조.
-[^kv-cache]: KV 캐시 (Key-Value Cache): 대화가 진행되는 동안 AI가 방금 전까지 나눈 대화의 맥락이나 계산 결과를 잊지 않도록 임시로 기록해두는 초고속 메모리 공간.
-[^fp8]: FP8 (8-bit Floating Point): 컴퓨터가 소수점을 표현할 때 기존보다 훨씬 적은 공간(8비트)만 사용하도록 압축하면서도 인공지능의 정확도는 거의 유지하는 혁신적인 데이터 처리 기술.
-[^race-condition]: 레이스 컨디션 (Race Condition): 여러 프로그램이 하나의 동일한 시스템 자원을 서로 먼저 가지려고 경쟁하면서, 예측 불가능한 순서로 동작이 뒤엉키는 오류 상태.
+## 디버깅 -- 세 개의 문제가 겹쳐 있었다
+
+이번 장애는 하나의 원인이 아니라 세 층위가 겹친 사건이었다.
+1. **직접 계기**는 커널/드라이버 업데이트로 인한 메모리 동작 변화였고,
+2. **관측된 첫 증상**은 Ray placement group 충돌이었으며,
+3. **복구를 어렵게 만든 운영 이슈**는 systemd의 재시작 정책이었다.
+
+아래에서는 이 세 문제를 순서대로 분리해 설명한다.
+
+### 문제 1: Ray Placement Group 잔존 상태로 인한 GPU 감지 실패
+
+vLLM v1 엔진은 APIServer와 EngineCore를 별도 프로세스로 실행한다. EngineCore가 Ray 클러스터에 연결할 때, 이전 EngineCore(또는 다른 vLLM 인스턴스)가 생성한 **placement group이 GPU 리소스를 전량 점유**하고 있으면 "GPU 없음" 에러가 발생한다.
+
+```python
+# ray_utils.py (vLLM v0.18.x)
+current_node_resource = available_resources_per_node()[current_node_id]
+if current_node_resource.get("GPU", 0) < 1:
+    raise ValueError("Current node has no GPU available.")
+```
+
+`available_resources_per_node()`는 placement group에 할당된 리소스를 제외한 "사용 가능한" 리소스를 반환한다. 이전 프로세스의 placement group이 정리되지 않으면, 실제로는 GPU가 있어도 0으로 보고된다. 즉, "이 머신에 GPU가 아예 없다"는 뜻이 아니라, Ray가 지금 당장 할당 가능한 GPU 리소스를 0으로 계산했다는 의미였다. 물리 GPU 존재 여부와 스케줄러가 보고하는 사용 가능 자원은 다르다.
+
+**해결**: stale placement group을 감지하여 자동으로 정리하는 패치를 작성했다. `ray.cluster_resources()`로 클러스터 전체의 GPU 존재를 확인한 후, stale PG를 제거하고 새 PG를 생성한다. 이 패치는 `fix-ray-gpu-check`라는 이름의 mod로 launch-cluster.sh에 통합했다.
+
+### 문제 2: systemd 재시작 정책으로 인한 이중 실행
+
+vLLM 클러스터를 관리하는 systemd 서비스(`vllm-cluster.service`)가 `Restart=on-failure`로 설정되어 있었다. vLLM이 placement group 에러로 실패하면, 30초 후 systemd가 재시작을 시도한다. 이 재시작된 프로세스와 수동으로 실행한 프로세스가 **동시에 GPU를 놓고 경쟁**하면서 서로의 placement group을 "stale"로 판단하고 제거하는 악순환이 발생했다.
+
+디버깅 과정에서 컨테이너 내부에 4~6개의 vLLM 프로세스가 동시에 실행되는 것을 발견했다. 각각이 서로의 Ray placement group을 제거하며 끝없이 재시작을 반복했다.
+
+```bash
+# 컨테이너 내부 프로세스 목록 (발견 당시)
+PID 610  vllm serve ... --gpu-memory-utilization-gb 112  # 수동 실행
+PID 3055 vllm serve ... --gpu-memory-utilization-gb 100  # systemd 자동 실행
+PID 4987 vllm serve ... --gpu-memory-utilization-gb 100  # systemd 재시작
+PID 5477 vllm serve ... --gpu-memory-utilization-gb 100  # systemd 재시작
+```
+
+**해결**: systemd 서비스 타입을 `Type=forking`에서 `Type=oneshot` + `RemainAfterExit=yes`로 변경했다.
+
+여기서 systemd의 서비스 타입이 왜 중요한지 짚고 넘어가자:
+
+| Type | 동작 방식 | 적합한 경우 |
+|------|----------|------------|
+| `simple` | ExecStart로 지정한 프로세스가 **메인 프로세스**다. 이 프로세스가 종료되면 systemd는 서비스가 중단된 것으로 판단한다 | 프로세스가 포그라운드에서 계속 실행되는 경우 (예: `nginx`, `node server.js`) |
+| `forking` | ExecStart 프로세스가 **자식 프로세스를 fork**하고 부모는 종료된다. systemd는 fork된 자식을 메인 프로세스로 추적한다 | 전통적인 데몬 (예: `sshd`, `apache2`) |
+| `oneshot` | ExecStart가 **한 번 실행되고 종료**된다. `RemainAfterExit=yes`와 함께 사용하면, 프로세스가 종료되어도 서비스를 "active" 상태로 유지한다 | 초기화 스크립트, 일회성 설정 작업 |
+
+`launch-cluster.sh -d`는 컨테이너 내부에서 `docker exec -d`로 vLLM을 백그라운드 실행하고 **즉시 종료**한다. 이때:
+- `Type=forking`이면: 부모 프로세스(launch-cluster.sh)가 종료되었으나 fork된 자식이 없으므로 systemd가 "실패"로 판단 → ExecStop 실행 → 서비스 중지
+- `Type=simple`이면: 메인 프로세스가 종료되었으므로 역시 "중지"로 판단 → Restart=on-failure 작동 → 무한 재시작
+- `Type=oneshot` + `RemainAfterExit=yes`면: 스크립트 정상 종료(exit 0) 후 서비스를 "active" 상태로 유지 → 재시작 없음
+
+### 문제 3: 커널/드라이버 업데이트 후 메모리 여유 감소
+
+placement group 문제를 해결하고 나니, **새로운 문제**가 드러났다:
+
+```
+ValueError: No available memory for the cache blocks.
+Available KV cache memory: -3.93 GiB
+```
+
+`--gpu-memory-utilization-gb 100`으로 100GB를 할당했는데, 모델이 ~104GB를 사용하여 KV 캐시에 할당할 메모리가 **-3.93GB**(부족)였다. 아침에는 같은 설정으로 정상 동작했는데?
+
+가장 유력한 원인은 **NVIDIA 드라이버 580.126.09 → 580.142와 커널 6.17.0-1008 → 1014 업그레이드** 이후 발생한 메모리 동작 변화였다. 업데이트 이후 동일 설정에서 모델 적재 메모리가 증가한 것으로 보아, 새 드라이버/커널 조합의 UMA 메모리 관리 방식에 변경이 있었던 것으로 추정된다.
+
+#### 커널 업데이트 전후 비교
+
+| 항목 | 커널 1008 + 드라이버 580.126 | 커널 1014 + 드라이버 580.142 |
+|------|----------------------------|----------------------------|
+| vLLM GPU 메모리 예산 (`--gpu-memory-utilization-gb`) | 112GB | 112GB |
+| 모델 적재 메모리 | ~100GB | ~104GB |
+| 모델 적재 후 남는 KV 캐시 예산 | ~12GB | ~8GB |
+| `gpu-mem-gb 100`일 때 KV 캐시 | 양수 (기동 가능) | **-3.93GB** (기동 불가) |
+| `gpu-mem-gb 112`일 때 최대 컨텍스트 | **262K 가능** | **32K만 가능** |
+| CUDA 그래프 컴파일 | ~5분 | **50분+ (멈춤)** |
+| `--enforce-eager` 필요 | 불필요 | **필요** |
+
+> 수치는 vLLM 시작 로그와 실제 기동 시 관측값을 바탕으로 한 근사치다.
+
+요약하면, **이전 커널에서는 112GB 예산 중 모델이 약 100GB를 사용해 KV 캐시에 약 12GB를 남길 수 있었고, 그 정도 여유가 있어야 262K 컨텍스트가 가능했다.** 반면 새 커널에서는 같은 112GB 예산에서도 모델 적재가 약 104GB까지 늘어나 KV 캐시에 약 8GB 정도밖에 남지 않았고, 그 결과 262K를 유지하지 못하고 32K 수준으로 줄여야 했다.
+
+`--gpu-memory-utilization-gb 100`에서 실패한 이유도 같은 맥락이다. 이전 커널에서는 100GB 예산 안에서도 모델이 간신히 올라가며 KV 캐시에 양수가 남았지만, 새 커널에서는 모델 적재만으로 약 104GB가 필요해져 시작 단계에서 이미 `Available KV cache memory: -3.93 GiB`가 되어 버렸다.
+
+새 커널/드라이버에서는 `--enforce-eager`(CUDA 그래프 비활성화) 없이는 서버가 시작조차 되지 않았다. CUDA 그래프 컴파일이 50분 이상 CPU 100%로 실행되다가 결국 타임아웃되는 현상이 발생했다. `--enforce-eager`를 추가하면 서버는 시작되지만, KV 캐시 메모리 제약으로 `--max-model-len`을 32768로 크게 낮춰야 했다.
+
+32K 컨텍스트는 코딩 에이전트로서 치명적인 제한이다. 시스템 프롬프트, 도구 정의, 대화 히스토리, 코드 컨텍스트를 합하면 쉽게 32K를 초과한다. 결국 122B-FP8을 쓰던 이유가 "262K 컨텍스트"였는데, 397B로 올리면서 오히려 컨텍스트가 줄어든다면 본말이 전도된 것이다.
+
+---
+
+## 해결 -- 커널 롤백
+
+결론은 단순했다. **이전 커널로 롤백**하는 것이다.
+
+### GRUB 설정
+
+DGX Spark은 UEFI GRUB을 사용한다. 이전 커널(`6.17.0-1008-nvidia`)이 아직 설치되어 있었으므로, GRUB 기본 부팅 커널을 변경했다.
+
+DGX Spark의 GRUB 메뉴는 submenu 구조로 되어 있어, 단순히 `GRUB_DEFAULT=2` 같은 인덱스로는 동작하지 않는다. menuentry의 ID를 `submenu>entry` 형식으로 지정해야 한다:
+
+```bash
+# 228 서버 (UUID: 66606008...)
+sudo grub-set-default "gnulinux-advanced-66606008-...>gnulinux-6.17.0-1008-nvidia-advanced-66606008-..."
+sudo sed -i "s/GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/" /etc/default/grub
+sudo update-grub
+
+# 237 서버 (UUID: 08692ac5...) -- 디스크 UUID가 다르므로 주의
+sudo grub-set-default "gnulinux-advanced-08692ac5-...>gnulinux-6.17.0-1008-nvidia-advanced-08692ac5-..."
+sudo sed -i "s/GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/" /etc/default/grub
+sudo update-grub
+```
+
+한 가지 주의: 내 환경에서는 커널 업데이트 직후 `grub.cfg`에 기대한 menuentry가 보이지 않았다. 커널 업데이트 후 `sudo update-grub`을 실행하지 않으면 GRUB 메뉴가 생성되지 않는다. 이 경우 GRUB은 fallback 동작으로 가장 최신 커널을 자동 부팅한다.
+
+### 롤백 결과
+
+양 노드 재부팅 후 `uname -r`로 커널 확인:
+
+```
+228: 6.17.0-1008-nvidia ✅
+237: 6.17.0-1008-nvidia ✅
+```
+
+vLLM을 원래 파라미터로 시작하자 **12분 만에 262K 컨텍스트로 서빙이 시작**되었다. `--enforce-eager` 없이, CUDA 그래프 컴파일도 정상적으로 완료되었다.
+
+---
+
+## 최종 구성
+
+| 항목 | 값 |
+|------|-----|
+| 모델 | Intel/Qwen3.5-397B-A17B-int4-AutoRound |
+| 규모 | 397B MoE (활성 17B), INT4 양자화 |
+| 컨텍스트 | 262,144 tokens (262K) |
+| KV 캐시 | FP8 |
+| GPU 메모리 할당 | 112GB (절대값) |
+| Tensor Parallel | 2 (Head + Worker) |
+| 분산 백엔드 | Ray |
+| Tool Calling | qwen3_coder 파서 |
+| Reasoning | qwen3 파서 |
+| 커널 | 6.17.0-1008-nvidia (고정) |
+| NVIDIA 드라이버 | 580.126.09 |
+
+```mermaid
+graph LR
+    A["Qwen3.5-122B<br/>FP8<br/>262K ctx"] -->|vLLM 0.18<br/>업그레이드| B["Qwen3.5-397B<br/>INT4<br/>262K ctx"]
+    B -->|커널 업데이트<br/>장애 발생| C["서빙 불가<br/>GPU PG 충돌<br/>메모리 부족"]
+    C -->|커널 롤백<br/>+ PG 패치| D["Qwen3.5-397B<br/>INT4<br/>262K ctx ✅"]
+
+    style A fill:#1a3a5c,stroke:#2e7bb5,color:#fff
+    style B fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style C fill:#8b0000,stroke:#ff4444,color:#fff
+    style D fill:#2d5016,stroke:#4a8c2a,color:#fff
+```
+
+---
+
+## 교훈
+
+### 1. apt upgrade는 LLM 서빙 서버에서 신중하게
+
+NVIDIA 드라이버와 커널은 GPU 메모리 관리에 직접적인 영향을 미친다. 특히 UMA 환경에서는 드라이버의 메모리 할당 정책이 바뀌면 동일한 설정에서도 모델이 올라가지 않을 수 있다.
+
+권장 사항:
+- LLM 서빙 서버에서는 `apt upgrade` 대신 **보안 패치만 선별 적용**
+- NVIDIA 관련 패키지는 `apt-mark hold`로 버전 고정
+- 업그레이드 전 반드시 현재 커널/드라이버 버전을 기록하고, 이전 커널이 GRUB에 남아있는지 확인
+
+```bash
+# NVIDIA 패키지 버전 고정
+sudo apt-mark hold nvidia-driver-580-open libnvidia-compute-580 \
+  linux-image-nvidia-hwe-24.04 linux-headers-nvidia-hwe-24.04
+```
+
+### 2. systemd 서비스 설계 시 프로세스 라이프사이클 이해
+
+`launch-cluster.sh -d`처럼 daemon 모드로 프로세스를 백그라운드에 띄우고 즉시 종료하는 스크립트에는 `Type=oneshot` + `RemainAfterExit=yes`가 적합하다. 앞서 설명한 것처럼 `Type=forking`이나 `Type=simple`은 이런 패턴의 스크립트와 궁합이 맞지 않아 의도치 않은 재시작이나 서비스 중지를 유발한다.
+
+또한 `Restart=on-failure`는 편리하지만, 실패 원인이 리소스 경합(placement group 충돌 등)인 경우 오히려 상황을 악화시킨다. 재시작 간격(`RestartSec`)을 충분히 길게 설정하거나, 재시작 전 정리 로직을 추가해야 한다.
+
+### 3. 디버깅 시 근본 원인과 파생 문제를 구분하라
+
+이번 장애에서는 세 개의 문제가 겹쳐 있었다:
+- **근본 원인**: 커널/드라이버 업그레이드로 인한 메모리 관리 변경
+- **파생 문제 1**: Ray placement group 잔존 (v1 엔진/Ray 운영 이슈)
+- **파생 문제 2**: systemd의 이중 실행
+
+처음에는 placement group 문제만 보였고, 이를 해결하니 메모리 문제가 드러났고, 메모리를 조정하니 systemd 이중 실행이 발견됐다. 각 문제를 개별적으로 해결하면서 6시간을 소비했는데, 처음부터 "아침에 됐던 것이 왜 안 되는가?"라는 질문에 집중했다면 커널 롤백이라는 답에 더 빨리 도달했을 것이다.
+
+---
+
+## 다음 과제
+
+커널 롤백은 임시 조치다. 이전 커널(6.17.0-1008)은 보안 패치가 중단될 수 있고, 새 커널에서 제공하는 성능 개선이나 하드웨어 지원을 활용하지 못한다.
+
+### 단기: 새 커널 호환성 확보
+
+- 새 커널에서 `--gpu-memory-utilization-gb` 값을 높이거나 `--enforce-eager` 조합으로 262K 컨텍스트를 확보하는 방법을 계속 탐색
+- vLLM 업스트림에 DGX Spark UMA 환경에서의 placement group 이슈를 보고
+- NVIDIA 드라이버 580.142에서의 UMA 메모리 할당 변경사항을 추적
+
+### 중장기: KV 캐시 압축 기술
+
+이번 장애의 본질적 원인은 397B 모델 가중치가 GPU 메모리의 대부분을 차지하여 KV 캐시에 할당할 여유가 부족하다는 것이다. 더 근본적으로는 KV 캐시 메모리 자체를 줄여야 한다. FP8이 현재 해법이라면, 앞으로는 [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)처럼 KV 캐시를 3-bit(Key) + 2-bit(Value)로 극단적 압축하는 기법이 이 문제를 바꿀 수 있다. 아직 vLLM 공식 통합은 없지만, 메모리 제약이 큰 환경에서는 가장 주목할 기술 중 하나다.
+
+---
+
+이 글 작성 시점(2026년 3월) 기준으로, 커널 롤백 후 수일간 안정적으로 동작하고 있으며, AI 코딩 에이전트(OpenClaw)에서 397B 모델을 262K 컨텍스트로 활용하고 있다.
+
+---
+
+## 부록: launch-cluster.sh 실행 흐름 상세
+
+> 아래는 본문과 별개로, 이후 같은 문제를 다시 만났을 때 참고하려고 남긴 운영 메모에 가깝다.
+
+DGX Spark에서 vLLM을 서빙하기 위해 [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) 프로젝트의 `launch-cluster.sh` 스크립트를 사용한다. 전체 822줄 중 핵심 로직을 순서도와 코드 발췌로 정리한다.
+
+### 실행 순서도
+
+```mermaid
+flowchart TD
+    A["launch-cluster.sh 실행"] --> B["인터페이스 자동 감지<br/>(QSFP, Ethernet IP)"]
+    B --> C["노드 자동 탐색<br/>(SSH peer scan)"]
+    C --> D{"액션 분기"}
+
+    D -->|stop| E["양 노드 컨테이너 중지<br/>(docker stop/rm)"]
+    D -->|start / exec| F["start_cluster()"]
+
+    F --> G["Head 노드 컨테이너 시작<br/>(docker run ... sleep infinity)"]
+    G --> H["Worker 노드 컨테이너 시작<br/>(SSH로 원격 docker run)"]
+    H --> I{"mod 적용"}
+
+    I --> J["각 mod의 run.sh를<br/>양 노드 컨테이너에서 실행<br/>(patch, 파일 복사 등)"]
+    J --> K{"--no-ray?"}
+
+    K -->|Ray 모드| L["Ray Head 시작<br/>(ray start --head)"]
+    L --> M["Ray Worker 시작<br/>(SSH → ray start --address)"]
+    M --> N["클러스터 준비 대기<br/>(ray status 폴링)"]
+
+    K -->|No-Ray 모드| O["PyTorch distributed<br/>직접 사용"]
+
+    N --> P{"exec 액션?"}
+    O --> P
+
+    P -->|exec| Q["docker exec -d vllm_node<br/>vllm serve ... (백그라운드)"]
+    P -->|start| R["docker logs -f<br/>(로그 tail)"]
+
+    Q --> S["서빙 시작 완료"]
+
+    style A fill:#1a3a5c,stroke:#2e7bb5,color:#fff
+    style S fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style E fill:#8b0000,stroke:#ff4444,color:#fff
+```
+
+### mod 시스템
+
+`--apply-mod` 옵션으로 지정한 디렉토리 안의 `run.sh`가 컨테이너 내부에서 실행되어, vLLM 소스 코드를 실행 시점에 패치한다. 이를 통해 vLLM 이미지를 다시 빌드하지 않고도 기능을 추가하거나 버그를 수정할 수 있다:
+
+- `gpu-mem-util-gb`: `--gpu-memory-utilization-gb` 파라미터 지원 추가
+- `fix-qwen3.5-autoround`: Qwen3.5 모델의 AutoRound INT4 양자화 호환성 패치
+- `fix-qwen3.5-chat-template`: Unsloth 포맷 채팅 템플릿 적용
+- `fix-ray-gpu-check`: stale placement group 자동 정리 (이번 장애에서 새로 생성)
+
+### 전체 구조
+
+```
+launch-cluster.sh
+├── 인자 파싱 (--nodes, -t, --apply-mod, --no-ray, -d, action 등)
+├── 인터페이스/노드 자동 감지 (QSFP IB_IF, ETH_IF, peer scan)
+├── 액션 분기
+│   ├── stop → cleanup() → docker stop/rm (양 노드)
+│   ├── status → ray status + docker ps (양 노드)
+│   └── start/exec → start_cluster()
+│       ├── check_cluster_running() → 이미 실행 중이면 스킵
+│       ├── docker run ... sleep infinity (Head/Worker)
+│       ├── apply_mod_to_container() (각 mod × 각 노드)
+│       │   ├── scp로 mod 파일 복사 (원격 노드)
+│       │   ├── docker cp로 컨테이너 내부 복사
+│       │   └── docker exec run.sh 실행
+│       ├── start_ray_head() / start_ray_worker() (Ray 모드)
+│       └── wait_for_cluster() → ray status 폴링
+└── exec 액션 후처리
+    ├── Ray 모드 → _exec_on_head() → docker exec -d "vllm serve ..."
+    └── No-Ray 모드 → exec_no_ray_cluster()
+        ├── Worker: docker exec -d (--nnodes, --node-rank 1, --headless)
+        └── Head: docker exec -d (--nnodes, --node-rank 0)
+```
+
+### 주요 함수
+
+**`start_cluster()`** — 컨테이너 생성 + mod 적용 + Ray 시작
+
+```bash
+# 컨테이너는 sleep infinity로 시작 (vLLM은 나중에 exec으로 실행)
+docker run --privileged --ipc=host --network=host --gpus all \
+  -v $HF_CACHE_DIR:/root/.cache/huggingface \
+  --name vllm_node -d $IMAGE_NAME sleep infinity
+
+# mod 적용: 각 mod 디렉토리의 run.sh를 컨테이너 내부에서 실행
+for mod in "${MOD_PATHS[@]}"; do
+  apply_mod_to_container "$node" "$CONTAINER_NAME" "$mod"
+done
+
+# Ray 클러스터 시작
+ray start --head --port 29501 ...           # Head 노드
+ssh $worker "docker exec vllm_node ray start --address=..."  # Worker 노드
+```
+
+**`_exec_on_head()`** — vLLM 서빙 프로세스 실행
+
+```bash
+# daemon 모드: 백그라운드로 실행하고 즉시 반환
+docker exec -d "$CONTAINER_NAME" bash -c "$cmd >> /proc/1/fd/1 2>&1"
+# 이 시점에서 launch-cluster.sh는 종료 (exit 0)
+# vLLM 프로세스는 컨테이너 내부에서 계속 실행
+```
+
+**`exec_no_ray_cluster()`** — PyTorch distributed 모드 (--no-ray)
+
+```bash
+# --distributed-executor-backend 플래그를 strip하고 mp로 교체
+clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
+worker_cmd="$clean --distributed-executor-backend mp \
+  --nnodes $total --node-rank $rank --master-addr $HEAD_IP --master-port $MASTER_PORT"
+```
