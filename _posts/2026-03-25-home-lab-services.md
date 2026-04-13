@@ -1,6 +1,6 @@
 ---
-title: "홈랩 시스템 아키텍처 (2) -- 서비스 구성과 개발 배경"
-excerpt: "홈랩 인프라 위에서 운영 중인 서비스들을 사용자용, 관리용, 데이터/ML 파이프라인으로 나누어 소개합니다."
+title: "홈랩 시스템 아키텍처 (2) - 서비스 구성과 개발 배경"
+excerpt: "홈랩 인프라 위에서 운영 중인 서비스들을 사용자용, 관리용, 데이터/기계학습(ML) 파이프라인으로 나누어 소개합니다."
 categories:
   - Infrastructure
 tags:
@@ -16,13 +16,13 @@ toc_sticky: true
 
 ## 개요
 
-[이전 글](/infrastructure/home-lab-architecture/)에서 홈랩의 하드웨어와 소프트웨어 스택을 다뤘다. 이 글에서는 그 인프라 위에서 운영 중인 서비스들을 소개한다.
+[이전 글](/infrastructure/home-lab-architecture/)에서는 온프레미스 기반 홈랩 인프라의 하드웨어 토폴로지와 핵심 소프트웨어 계층(Control Plane 구성)을 살펴보았다. 본 글에서는 해당 오케스트레이션 구조 위에서 마이크로서비스 형태로 구동 중인 주요 애플리케이션 워크로드를 세부적으로 기술한다.
 
-서비스는 크게 세 가지로 나뉜다.
+현재 운영 중인 서비스 워크로드는 다음과 같이 크게 3개의 계층으로 분류할 수 있다.
 
-1. **사용자용 서비스**: 분석 환경, AI 도구, 검색 엔진 등 일반 사용자가 직접 접속하여 사용하는 서비스
-2. **관리용 서비스**: 서비스 상태 모니터링, 에이전트 작업 관리 등 운영/관리 목적의 서비스
-3. **데이터 수집 및 ML 파이프라인**: 백그라운드에서 자동 실행되는 데이터 수집기와 ML 워크플로우
+1. **사용자용 서비스**: 분석 포털, Jupyter 샌드박스, LLM 프론트엔드(UI) 등 클라이언트 접점(End-User) 애플리케이션이다.
+2. **제어 영역(Control Plane) 서비스**: 컨테이너 헬스체크 모니터링 및 로컬 파이프라인 내 다중 AI 에이전트 워크플로우를 통제하는 관제 인프라다.
+3. **데이터 수집 및 ML 파이프라인**: 스케줄러 기반 백그라운드 일괄(Batch) 데이터 배치 프로세스 및 모델 훈련/추론 자동화 오케스트레이션 파이프라인이다.
 
 ---
 
@@ -30,145 +30,138 @@ toc_sticky: true
 
 ### Analysis Portal (분석 포털)
 
-Kubeflow 기반 JupyterLab 환경을 통합 관리하는 포털이다. 사용자가 웹에서 CPU/Memory/GPU 스펙과 노트북 이미지 종류(Base, DataScience, Full)를 선택하여 분석 환경을 요청하면, 관리자가 승인하고, 승인 후 Kubeflow Notebook CRD가 자동으로 생성되는 구조다.
+Kubeflow[^kubeflow] 워크스페이스에 대한 엔드유저 접근성을 개선하기 위해 자체 개발한 프론트엔드 포털이다. 리소스 할당(CPU/RAM/GPU) 및 분석 컨테이너 이미지(기본, 데이터 사이언스, 고급 등) 프로비저닝 워크플로우를 통제한다. 
 
-이 포털을 별도로 개발한 이유는 Kubeflow 기본 UI만으로는 사용자 관리, 자원 통제, DB 연동 등이 부족했기 때문이다. 주요 기능은 다음과 같다:
+기본 Kubeflow 대시보드의 RBAC(Role-Based Access Control) 기능 제약으로 인해 독립적인 포털을 구축했다.
 
-- **환경 라이프사이클 관리**: 요청 - 승인 - 생성 - 실행/중지/재시작 - 삭제
-- **PostgreSQL 연동**: 사용자 생성 시 PostgreSQL 계정 자동 동기화, 스키마별 권한 관리 UI, 권한 매트릭스 뷰(전체 사용자 DB/스키마 권한을 한눈에 확인)
-- **VectorDB 관리**: Elasticsearch, CouchDB 사용자 계정 자동 동기화 및 권한 관리
-- **DB 메타데이터 관리**: 테이블/칼럼 설명(COMMENT) 인라인 편집, 미등록 테이블 하이라이트
-- **공유 리소스 폴더**: NFS 기반. Admin은 읽기/쓰기, 일반 사용자는 읽기 전용
-- **사용자 가이드**: 빠른 시작, GitLab 사용법, AI API 연동, PostgreSQL 사용법, FAQ를 탭형으로 제공
+- **작업 환경 관리**: 인스턴스 라이프사이클(생성, 구동, 중지, 삭제) 관리 기능.
+- **데이터베이스 연동**: 포털 유저 계정 발급 시 PostgreSQL의 Role을 동기화하여 UI 기반의 DB 접근 권한 제어 지원.
+- **벡터 데이터베이스(Vector DB) 관리**: Elasticsearch, CouchDB 등 임베딩 데이터베이스 인스턴스 엑세스 권한 연동.
+- **스토리지 마운트**: 사용자별 NFS 볼륨 Read-only 동적 마운트 할당 파이프라인 적용.
+- **사용자 안내서 내장**: 시스템 FAQ 및 모듈 연동 가이드 탑재.
 
-기술 스택은 FastAPI + Jinja2 Templates + HTMX이다. React 같은 SPA 프레임워크 대신 HTMX(Server-Driven UI)를 선택한 이유는, 관리자 도구 특성상 복잡한 클라이언트 상태 관리보다는 서버 렌더링이 적합하다고 판단했기 때문이다.
+프론트엔드 계층은 HTMX[^htmx]를 도입하여 구축했다. 관리 시스템의 워크로드 특성상 복잡한 클라이언트 측 렌더링보다는 명시적인 상태 관리 및 경량 API 통신성에 중점을 두었다.
 
-### JupyterLab 노트북 환경
+### JupyterLab 분석 샌드박스 
 
-분석 포털에서 생성된 JupyterLab에는 다음이 기본으로 포함된다:
+프로비저닝된 사용자 개별 샌드박스 컨테이너(JupyterLab[^jupyterlab]) 내부에는 다음 도구와 구성이 사전 세팅되어 있다.
 
-- **jupyter-ai (Jupyternaut)**: 노트북 내에서 AI 코딩 어시스턴트를 사용할 수 있는 확장. 기본 모델은 `qwen3-coder-next-ko`(한국어 응답 지원)이며, 내부 Ollama 서버에 연결된다.
-- **임베딩 서비스 연동**: 87 서버에서 운영되는 `ollama-embed-87`(nomic-embed-text, 4096 dims)에 자동 연결
-- **PostgreSQL 접근**: 분석 포털에서 부여받은 권한에 따라 `analytics_shared`, `stock_analytics` 등의 DB에 접근 가능
-- **GitLab 연동**: LDAP 공통 계정으로 내부 GitLab에 SSH/HTTPS push/pull 가능
+- **Jupyternaut 연동**: 코드 생성 어시스턴트로 로컬 클러스터망의 Ollama Endpoint와 직접 연동되어 PII 등 데이터 외부 유출 리스크를 원천 차단한다.
+- **임베딩(Embedding) 서버 연동**: 프로토타입 단계의 RAG 체인 파이프라인 구성을 위해 로컬 임베딩 모델 서버 Endpoint가 기본 등록되어 있다.
+- **데이터베이스 프로비저닝**: 컨테이너 런타임에 주입된 환경변수를 통해 인가된 데이터 소스에만 제한적인 접근이 허용된다.
+- **형상 관리 시스템(Git) 연동**: GitLab 리포지토리와 SSH Key 프로비저닝 없이 API 토큰 기반으로 인증되도록 구성되었다.
 
 ### Langflow
 
-
-AI 워크플로우를 시각적으로 구성할 수 있는 로우코드 플랫폼이다. 분석 포털 사이드바에서 바로 접근할 수 있으며, `AUTO_LOGIN=true`로 별도 인증 없이 동작한다(내부 네트워크 전용).
-
-배포한 이유는 CoLLM 활용 경험이 없는 사용자들도 GUI로 LLM 체인을 구성하고 RAG 파이프라인을 테스트할 수 있게 하기 위해서다. 내부에서 Ollama(임베딩/소형 모델), vLLM(대형 LLM), Elasticsearch, CouchDB와 연동할 수 있도록 환경변수를 사전 설정해두었다.
-
-RAG Vector Store로는 Elasticsearch(대규모), Chroma DB(프로토타이핑), CouchDB Vector Store(커스텀 컴포넌트, 코사인 유사도 기반) 세 가지 옵션을 제공한다.
+코드 레벨의 조작 없이 노드 기반 비주얼 에디터를 통해 LLM 파이프라인을 설계하는 Low-code 프레임워크다. PoC(Proof of Concept) 단계의 RAG[^rag] 체인 및 에이전트 구성을 신속하게 프로토타이핑한다. 인프라 클러스터 내부에 배포된 다수의 오픈소스 LLM 및 Vector DB Endpoint 설정이 사전 주입되어 있다.
 
 ### OpenWebUI
 
-
-LLM 채팅 웹 인터페이스. ChatGPT와 유사한 UI로 내부 LLM에 접근할 수 있다. vLLM(DGX Spark)과 Ollama 모두의 모델에 접근 가능하며, OpenAI 호환 API를 통해 동일한 인터페이스로 사용한다. 외부에서도 포트포워딩을 통해 접근 가능하도록 열어두었다.
+표준적인 멀티 모델 챗봇 프론트엔드다. DGX Spark 클러스터에서 할당되는 대규모 파라미터(Heavy-weight) 모델부터 Worker 노드의 소형 모델까지 vLLM API를 취합하여 단일 창구에서 성능을 테스트한다.
 
 ### SearXNG
 
-
-프라이버시 중심의 메타 검색 엔진이다. 여러 검색 엔진의 결과를 집계하여 보여주며, 사용자 추적이 없다. AI 에이전트들이 웹 검색 기능이 필요할 때 외부 서비스(Google API 등)에 의존하지 않고 내부에서 검색할 수 있도록 배포했다.
+셀프 호스팅 방식의 오픈소스 메타 검색 엔진이다. 내부망의 멀티 AI 에이전트들이 웹 검색 API를 호출할 시 외부 써드파티 검색 엔진의 쿼리 로깅을 우회하고 자체 크롤링 트래픽을 처리하는 프록시 역할을 담당한다.
 
 ### ComfyUI
 
-
-Stable Diffusion 기반 이미지 생성 노드 에디터. Worker 서버의 GPU에서 실행된다.
+Stable Diffusion 모델 기반의 이미지 생성 파이프라인을 노드 시퀀스로 제어하는 도구다. VRAM 점유 최적화를 위해 GPU Time-slicing이 적용된 Worker 노드에서 전용 컨테이너 격리 상태로 구동된다.
 
 ---
 
-## 관리용 서비스
+## 제어 영역(Control Plane) 서비스
 
-### Service Portal (서비스 포털)
+### Service Portal (서비스 통합 포털)
 
+현재 K3s 인프라 내부에는 40여 개 이상의 마이크로서비스가 프로비저닝되어 있다. 파편화된 컨테이너의 포트 할당 관리 및 헬스체크 프로세스를 통합 모니터링하기 위해 개발한 커스텀 컨트롤러 뷰어다.
 
-모든 내부 서비스를 한곳에서 관리하고 접근할 수 있는 통합 대시보드다. 현재 28개 이상의 서비스가 등록되어 있다.
+- **실시간 상태 폴링**: 30초 주기로 워크로드 엔드포인트에 커스텀 Probe를 요청하여 응답 레이턴시 매트릭을 갱신한다.
+- **프로세스 런타임 제어**: 권한이 인가된 세션에 한하여 타겟 컨테이너의 강제 재시작(Restart) 및 종료 작업을 UI상에서 트리거한다.
+- **Endpoint 디스커버리**: K3s 클러스터에 배포되는 신규 워크로드의 메타데이터를 스캔하여 대시보드 리스트에 동적으로 로드한다.
+- **시스템 토폴로지 매핑**: 아키텍처 상의 논리적 계층 구조를 시각화하여 관제 패널로 제공한다.
+- **노드 리소스 매트릭 집계**: 개별 인스턴스의 프로세서 및 메모리 사용량 수치를 수집 및 집계한다.
+- **Auto-healing 로직 적용**: 헬스체크 타임아웃 이벤트 발생 시 타겟 파드의 재시작을 트리거하며 연속 복구 실패 시에만 관리자 알림을 발송한다. 코어 인프라 제어 영역 파드는 트리거 대상에서 하드코딩으로 예외 처리되어 시스템 락아웃을 방지한다.
 
-이 서비스를 만든 배경은, 서비스 수가 늘어나면서 어떤 서비스가 어느 포트에서 돌아가는지, 정상 동작하고 있는지, 어떤 사용자가 접근 권한이 있는지를 일일이 확인하는 것이 어려워졌기 때문이다. 주요 기능은 다음과 같다:
-
-- **실시간 헬스체크**: 30초 간격으로 모든 서비스의 상태와 응답 시간을 측정
-- **서비스 제어**: 관리자가 웹에서 서비스를 실행/중지/재시작/업데이트 (kubectl scale, rollout 기반)
-- **K8s 자동 디스커버리**: 클러스터에서 미등록 워크로드를 자동 탐지하고 원클릭으로 포털에 등록
-- **전체 토폴로지 시각화**: 28개 서비스를 카테고리별(Infrastructure, Database, DevOps, Monitoring, AI/ML, Tools) 레이어로 배치한 관계도
-- **클러스터 오버뷰**: 노드별 CPU/Memory/GPU 사용량 게이지, 네임스페이스별 Pod 분포
-- **감사 로그**: 서비스 제어, 권한 변경, 레지스트리 수정 등 모든 관리 작업 기록
-- **알림 에스컬레이션**: L1(알림) - L2(자동 재시작) - L3(긴급 알림) 3단계 자동 대응. 인프라 핵심 서비스 9개는 보호 목록으로 자동 재시작 대상에서 제외
-
-기술 스택은 FastAPI(Backend) + React 18 + TypeScript + Tailwind CSS(Frontend)이다. 분석 포털과 달리 React SPA를 선택한 이유는, 헬스체크 결과의 실시간 갱신, 토폴로지 시각화, 복잡한 필터링/정렬 등 인터랙티브한 요소가 많아 클라이언트 사이드 렌더링이 적합하다고 판단했기 때문이다.
-
-LDAP/Keycloak SSO 인증을 사용하며, 관리자/일반 사용자 권한에 따라 노출되는 기능이 다르다. MCP(Model Context Protocol) 서버로도 운영되어 AI 에이전트가 서비스 레지스트리를 프로그래밍 방식으로 조회/등록할 수 있다.
+고빈도의 상태 데이터 갱신 처리를 위해 프론트엔드 계층은 React[^react]를 기반으로 구축했다. 분산된 AI 에이전트들이 인프라 상태를 참조할 경우 표준 MCP(Model Context Protocol) 통신 규약을 통해 해당 포털의 매트릭 메타데이터를 연동받도록 설계했다.
 
 ### Agent Task Hub (ATH)
 
+멀티 AI 에이전트 간 컴퓨팅 자원 확보 경합, 역할 충돌, 코드 오염 등의 Race Condition을 제어하기 위해 자체 설계한 작업 관제(Orchestration) 시스템이다. 초기 SQLite 기반에서 현재 PostgreSQL로 마이그레이션되어 동시성 및 안정성을 확보했다.
 
-여러 AI 코딩 에이전트(Antigravity, Claude Code, OpenCode, OpenClaw)가 동일한 코드베이스에서 동시에 작업할 때 충돌을 방지하기 위해 직접 설계하고 구현한 시스템이다.
+- **작업 Task 메타데이터 레지스트리**: 에이전트는 코드 런타임 진입 전, 반드시 ATH API를 통해 작업 목적 및 계획을 Task 메타데이터로 등록해야 한다.
+- **지식 베이스(Knowledge Base) 풀**: 작업 런타임 중 발견된 시스템 설정, 에러 레퍼런스 및 해결 패턴을 적재하여, 커뮤니케이션 오버헤드 없이 다른 에이전트 간의 컨텍스트 추론 성능을 향상시킨다. sentence-transformers 기반의 벡터 임베딩을 통해 시맨틱(semantic) 검색, 키워드 검색, 하이브리드 검색을 지원한다.
+- **동시성 파일 Lock 제어**: 소스 코드 등 동일 파일에 대한 병렬 I/O 경합을 방지하기 위해 분산 락 개념을 적용했다. (기본 TTL 5분)
+- **포커스 메세징 브로드캐스트**: 현재 구동 중인 개별 에이전트의 포커스 지점 및 작업 경계를 인프라 전역 채널에 브로드캐스트하여 중복 연산을 차단한다.
+- **하네스(Harness) 시스템**: 에이전트별 신뢰도(trust_score)를 수치화하여 작업 결과의 피드백에 따라 자동 조정하며, 위험도 높은 작업 시 교차 검증(Phase 6a)을 강제한다.
+- **Wiki 컴파일러**: 지식베이스에 축적된 항목들을 재귀적 분할, 수평 상호 참조(Cross-Reference), 컨셉 허브(Concept Hub) 등의 구조로 자동 컴파일하여 에이전트가 지식을 효율적으로 탐색할 수 있도록 지원한다.
+- **컨텍스트 브리핑**: 에이전트가 작업 시작 전 하네스 정보, 실패 이력, 관련 지식을 토큰 예산 내에서 자동 수집하여 컨텍스트 단절을 최소화한다.
+- **통합 Audit 로깅**: 전체 에이전트 활동 이력 통제를 위한 단일 채널 로깅 인터페이스다.
 
-개발 동기는 다음과 같다. 실제로 여러 에이전트에 동시에 작업을 시키다 보면 동일한 파일을 동시에 수정하거나, 이미 완료된 작업을 중복으로 수행하거나, 한 에이전트가 발견한 문제를 다른 에이전트가 모르는 상황이 빈번하게 발생했다. 이를 해결하기 위해 작업 등록/추적, 지식 공유, 파일 잠금의 세 가지 핵심 기능을 갖춘 중앙 허브를 만들었다.
+ATH의 상세 고도화 과정은 [별도 아티클](/development/ath-advanced-features/)에서 다룬다.
 
-주요 기능:
+### ATH Dashboard (ATH 전용 대시보드)
 
-- **작업 관리**: 에이전트가 작업 시작 전에 Task를 등록하고, 진행 상태와 결과를 기록. 부모-자식 Task 연결로 관련 작업 추적
-- **지식 베이스**: 에이전트가 작업 중 발견한 사실, 결정 사항, 에러 해결법, 패턴 등을 등록. 다른 에이전트가 검색하여 활용
-- **파일 잠금**: 에이전트가 특정 파일 수정 전에 잠금을 획득하여 동시 수정 충돌 방지. 5분 주기로 만료된 잠금 자동 정리
-- **포커스 관리**: 현재 각 에이전트가 어떤 작업 영역에 집중하고 있는지 공유
-- **대시보드**: 에이전트 상태, 작업 현황, 지식 베이스, 활동 로그를 한눈에 볼 수 있는 웹 UI
+ATH에 축적된 데이터를 시각화하는 Streamlit 기반 모니터링 환경이다. 에이전트 포커스 현황, 상태별 Task 관리 내역, 실시간 최신 Knowledge 현황, 교차 검증 이력 및 에이전트 로그를 시각화하여 종합적인 오케스트레이션 관제가 가능하다.
 
-FastAPI + SQLite(WAL 모드)로 구현했다. 별도의 DB 서버를 두지 않은 이유는 단일 프로세스만 접근하므로 동시성 문제가 없고, 인프라를 경량하게 유지하기 위해서다.
+### Log Analyzer (통합 로그 분석 컨트롤러)
 
-각 에이전트는 자신의 설정 파일(GEMINI.md, CLAUDE.md, AGENTS.md 등)에 ATH 규칙이 삽입되어 있어, 작업 시작 시 자동으로 Task를 등록하고 완료 시 상태를 업데이트하도록 강제된다. CLI(`ath` 명령)와 MCP 서버 두 가지 방식으로 접근할 수 있다.
+분산된 마이크로서비스 파드에서 생성되는 로그 스트림을 수집하고 파싱하는 Streamlit 기반의 지능형 관제 환경이다. 단순 정적 로그 수집(Aggregation)을 넘어 아래의 지능적 RAG 기반 분석 시스템이 모듈화되어 있다.
 
-### 로그 분석기
-
-
-Streamlit 기반 웹 대시보드로, 시스템 로그를 수집하고 RAG 기반으로 오류를 분석/해결하는 시스템이다.
-
-- 5분 간격으로 시스템 메트릭(CPU, 메모리, zombie 프로세스, 헤비 유저)을 자동 수집
-- sentence-transformers 기반 벡터 임베딩으로 유사 로그/해결 문서 검색
-- PII(개인식별정보) 자동 마스킹
-- 오류 해결 문서를 태그 기반으로 등록/검색/매칭
+- **원격 매트릭 및 병목 폴링**: Cron 데몬을 통해 5분 간격으로 대상 노드의 CPU Overload, Zombie 프로세스, 메모리 병목 현상을 폴링 수집한다.
+- **PII(개인식별정보) 동적 마스킹**: 로그 데이터에 평문으로 존재할 수 있는 이메일, IP 주소 등의 PII를 정규식 및 모델을 통해 렌더링 전단에서 자동 마스킹 처리하여 보안 컴플라이언스를 유지한다.
+- **RAG 기반 트러블슈팅 엔진**: 에러 스택트레이스 감지 시, 해당 텍스트를 임베딩 벡터를 통해 수치화한 뒤 내부 데이터베이스에 기 적재된 컴포넌트 장애 특화 문서(Knowledge)와 코사인 유사도를 계산하여 조치 가이드라인을 반환하는 RAG 워크플로우를 제공한다.
 
 ---
 
-## 데이터 수집기 및 ML 파이프라인
+## 데이터 수집 및 ML 파이프라인
 
-### 주식 데이터 수집기
+### 트레이딩 데이터 수집 배치 워커
 
-Kubeflow Pipeline Recurring Run으로 자동 실행되는 데이터 수집기들이다:
+Kubeflow Pipelines 등에 스케줄링되어 특정 트리거 조건에 맞춰 일괄(Batch) 수집 작업을 수행하는 워커 프로세스 목록이다.
 
-| 수집기 | 대상 | 스케줄 |
+| 수집 스크립트 | 타겟 레코드 | 주기 |
 |--------|------|--------|
-| KR Stock Collector | 한국 주식 시세 (yfinance) | 매일 |
-| US Stock Collector | 미국 주식 시세 (yfinance) | 매일 |
-| Exchange Rate Collector | 한국수출입은행 환율 API | 매일 |
-| Index Collector | 글로벌 지수 (VIX 등) | 매일 |
-| Market Cap Collector | 미국 시가총액 | 매일 |
-| Stock Data Sync | PostgreSQL - Teradata 동기화 | 매일 |
+| KR Stock Collector | 국내 증시 시계열 데이터 (yfinance API) | 일배치 |
+| US Stock Collector | 미국 증시 시계열 데이터 (yfinance API) | 일배치 |
+| Exchange Rate Collector | 한국수출입은행 Open API 기반 환율 정보 | 일배치 |
+| Index Collector | 글로벌 지수 및 변동성 지표(VIX 등) 수집 | 일배치 |
+| Market Cap Collector | 상장사 시가총액 정보 스크래핑 | 일배치 |
+| Stock Data Sync | PostgreSQL → Teradata 간 스키마 논리적 레플리케이션(Replication) | 일배치 |
 
-수집된 데이터는 PostgreSQL에 적재되고, Stock Data Sync 파이프라인이 이를 Teradata로 동기화한다.
+원천(Raw) 데이터가 1차 스토리지인 PostgreSQL 인스턴스에 적재된 직후, Data Sync ETL 워크플로우가 트리거되어 이를 분석계 DW(Teradata)로 적재함으로써 예측 파이프라인의 연산 가용성을 확보한다.
 
-### Stock Prediction ML Pipeline
+### 가격 시계열 예측 ML 파이프라인
 
-4가지 조합의 ML 파이프라인이 Kubeflow에서 실행된다:
+ML옵스(MLOps) 아키텍처 비교 검증 및 인프라 프로파일링 확보 타겟으로 설계된 시계열 예측 모형 파이프라인이다.
 
-| 파이프라인 | 데이터 접근 | 컴퓨트 |
+| 파이프라인 환경 | 쿼리 및 연산 계층 | 컴퓨팅 자원 |
 |-----------|------------|--------|
-| teradatasql-cpu | teradatasql (SQL 드라이버) | CPU |
-| teradatasql-gpu | teradatasql (SQL 드라이버) | GPU |
-| teradataml-cpu | teradataml (in-DB analytics) | CPU |
-| teradataml-gpu | teradataml (in-DB analytics) | GPU |
+| teradatasql-cpu | 애플리케이션 계층 스탠다드 SQL | 시스템 CPU |
+| teradatasql-gpu | 애플리케이션 계층 스탠다드 SQL | GPU 병렬 가속 |
+| teradataml-cpu | In-Database Analytic 함수 호출 | 시스템 CPU |
+| teradataml-gpu | In-Database Analytic 함수 호출 | GPU 병렬 가속 |
 
-이 파이프라인의 주된 목적은 주가 예측 모델 자체보다는, Teradata의 두 가지 데이터 로드 방식(`teradatasql` vs `teradataml`)의 차이와 CPU/GPU 간 학습 성능을 비교 테스트하는 것이다. 주가 예측은 이를 위한 실제 데이터 기반 워크로드로 사용되고 있다. 이 부분은 별도의 글에서 상세히 다룰 예정이다.
+해당 파이프라인은 직접적인 트레이딩 수익 창출보다는 데이터베이스 연산(In-Database) 아키텍처와 분리된 애플리케이션 계층 연산 간의 성능 프로파일링 지표 추출에 주목적이 있다. 네트워크 구간의 Data I/O 병목 및 GPU 스케줄링 간 메모리 오버헤드 측정 등 실측 아키텍처 검증 환경으로 워크로드를 할당하고 있다.
 
 ### Docling Extractor API
 
+PDF, 바이너리 문서 포맷 등을 입력받아 OCR(광학 문자 인식) 파이프라인 및 레이아웃 파싱 알고리즘을 거쳐 구조화된 마크다운/JSON 포맷으로 반환하는 마이크로 API 컨트롤러다. 지식 베이스 구축 인제스천(Ingestion) 단계의 전처리기를 담당한다.
 
-문서(PDF, 이미지 등)에서 텍스트를 추출하는 REST API. Android OCR 앱과 연동하여 카메라로 스캔한 문서의 텍스트를 Markdown 형태로 반환한다.
+### Teradata Vector 검색 PoC
 
-### Teradata Vector PoC
+Teradata Native Vector 쿼리 활용성을 검증하는 PoC(Proof of Concept) 서비스 애플리케이션이다. VLM/LLM을 통한 텍스트 임베딩 모델 연동, 유클리디안 거리 및 코사인 유사도 검색 연산을 애플리케이션 단에서 오케스트레이션하는 UI 인터페이스로 운용하고 있다.
 
+### OpenClaw RAG MCP
 
-Teradata에서 벡터 검색 기능을 테스트하는 개념 증명. Streamlit 대시보드로 문서 등록, 벡터 저장소 관리, 임베딩 구조 확인, 벡터 검색, 대시보드 시각화 다섯 가지 기능을 제공한다.
+로컬 LLM 기반 에이전트(OpenClaw)의 컨텍스트 추론 성능을 보강하기 위해 구축한 MCP 서버다. 에이전트가 작업 시작 전 ATH 지식베이스, Wiki 문서, 시스템 상태 등 관련 정보를 자동으로 수집하여 프롬프트에 주입하는 RAG 레이어 역할을 담당한다.
+
+### Stock Prediction Dashboard
+
+시계열 예측 ML 파이프라인의 결과를 시각화하는 Streamlit 기반 대시보드다. TensorBoard와 연동되어 모델 학습 매트릭 모니터링 및 예측 결과 비교 분석 환경을 제공한다.
+
+### DGX Dashboard (DGX Spark 클러스터 모니터링)
+
+DGX Spark 2노드 클러스터의 상태를 모니터링하는 전용 대시보드다. vLLM 서비스 상태, 메모리 사용량, 모델 로딩 상태 등을 활성화된 프로브로 수집하여 시각화한다.
 
 ---
 
@@ -187,15 +180,21 @@ graph LR
     subgraph AdminServices["관리용 서비스"]
         SP[Service Portal]
         ATH[Agent Task Hub]
+        ATHD[ATH Dashboard]
+        DGXD[DGX Dashboard]
     end
 
-    subgraph DataML["데이터/ML"]
+    subgraph DataML["데이터/ML 일괄 처리"]
         KFP[Kubeflow Pipelines]
         COL[Data Collectors]
         STK[Stock Prediction<br/>Dashboard]
     end
 
-    subgraph Infra["인프라"]
+    subgraph AgentInfra["에이전트 인프라"]
+        RAGMCP[OpenClaw<br/>RAG MCP]
+    end
+
+    subgraph Infra["인프라스트럭처"]
         PG[(PostgreSQL)]
         TD[(Teradata)]
         ES[(Elasticsearch)]
@@ -216,7 +215,11 @@ graph LR
     SP --> LDAP
     SP --> KC
     SP --> PG
-    ATH -.-> SP
+    ATH --> PG
+    ATHD --> ATH
+    DGXD -.-> VLLM
+    RAGMCP --> ATH
+    RAGMCP --> VLLM
     KFP --> PG
     KFP --> TD
     COL --> PG
@@ -225,17 +228,38 @@ graph LR
     style AP fill:#1a5276,stroke:#2e86c1,color:#fff
     style SP fill:#1a5276,stroke:#2e86c1,color:#fff
     style ATH fill:#4a235a,stroke:#7d3c98,color:#fff
+    style ATHD fill:#4a235a,stroke:#7d3c98,color:#fff
+    style DGXD fill:#4a235a,stroke:#7d3c98,color:#fff
     style VLLM fill:#5c1a5c,stroke:#9b2d9b,color:#fff
+    style RAGMCP fill:#2d5016,stroke:#4a8c2a,color:#fff
 ```
 
 ---
 
 ## 마무리
 
-현재 진행 중이거나 계획 중인 작업도 있다:
+향후 시스템 아키텍처 레벨에서의 추가 연동 및 고도화 파이프라인 마일스톤은 다음과 같다.
 
-- **Keycloak SSO 전면 통합**: Grafana, Rancher, Analysis Portal, Service Portal 등 모든 서비스에 SSO 로그인 적용
-- **GitLab CI/CD 모노레포 확대**: 현재 Service Portal만 연결된 CI/CD 파이프라인을 다른 서비스로 확장
-- **Agent Chat Hub**: AI 에이전트와의 대화를 웹 인터페이스로 통합하는 서비스 개발 중
+- **단일 인증 프로토콜(Keycloak SSO) 전면 통합**: OIDC 토큰 기반 인증 통합 작업을 통해, 파편화된 서비스 인증 레이어를 중앙 제어 SSO 프로세스로 마이그레이션 적용 중이다.
+- **GitLab CI/CD 모노레포(Monorepo) 커버리지 확대**: 리포지토리 커밋 이벤트 트리거와 무중단 롤아웃이 연동되는 파이프라인 구조를 K3s 마이크로서비스 전역으로 커버리지 확충하는 과정에 있다.
+- **ATH 지식 그래프 고도화**: 에이전트가 축적한 지식 항목 간의 엔티티 관계 시각화 및 자동 연결 한도 확장을 추진 중이다.
 
-이후 글에서는 각 프로젝트별로 설계 의도, 구현 과정, 트러블슈팅 경험을 더 깊이 다룰 예정이다.
+이후 연재 포스트에서는 개별 마이크로서비스 및 파이프라인 배포 시 직면했던 장애 트러블슈팅 내역과, 아키텍처적 Trade-off 의사 결정 과정을 세부적으로 다룰 예정이다.
+
+---
+
+## 업데이트 내역
+
+| 날짜 | 내용 |
+|------|------|
+| 2026-03-25 | 초판 작성 |
+| 2026-04-08 | Zero Trust 보안 아키텍처 및 PII 마스킹 내용 반영, 전문적 어투로 리팩토링 |
+| 2026-04-13 | 신규 서비스 4종 추가(ATH Dashboard, DGX Dashboard, OpenClaw RAG MCP, Stock Prediction Dashboard), ATH PostgreSQL 전환/시맨틱 검색/하네스/Wiki 컴파일러 등 고도화 내용 반영, Mermaid 다이어그램 갱신 |
+
+---
+
+[^kubeflow]: 컨테이너 기반 머신러닝 시스템(MLOps) 컴포넌트를 배포하고 파이프라인 워크플로우를 스케줄링/관리할 수 있도록 돕는 클라우드 네이티브 오픈소스 플랫폼이다.
+[^htmx]: 별도의 프론트엔드 자바스크립트 프레임워크 스택 없이도 HTML 속성을 통해 명시적인 AJAX 통신 및 상태 전환 렌더링을 구현할 수 있도록 지원하는 경량 툴이다.
+[^jupyterlab]: 데이터 사이언스 분석 컴퓨팅을 위해 셀 단위 런타임 코드 실행 및 시각화 피드백을 제공하는 대화형 개발 환경(IDE)이다.
+[^rag]: 검색 증강 생성(Retrieval-Augmented Generation). LLM의 할루시네이션(환각)을 제어하기 위해 텍스트 인제스천 단계에서 내부 데이터베이스 지식을 먼저 검색 및 컨텍스트화하여 프롬프트에 제공하는 아키텍처 체계다.
+[^react]: Virtual DOM 아키텍처를 기반으로 단방향 상태 렌더링 및 UI 컴포넌트 라이프사이클을 효율적으로 관리하기 위해 고안된 프론트엔드 자바스크립트 라이브러리다.
