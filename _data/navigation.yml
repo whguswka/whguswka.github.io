@@ -1,3 +1,4 @@
+# 상단 메뉴
 main:
   - title: "Categories"
     url: /categories/
@@ -5,3 +6,36 @@ main:
     url: /tags/
   - title: "Search"
     url: /search/
+
+# 좌측 사이드바 네비게이션 (폴더 트리)
+docs:
+  - title: "🏗️ 인프라 구축"
+    children:
+      - title: "시스템 아키텍처 (1) — 인프라와 소프트웨어 스택"
+        url: /infrastructure/home-lab-architecture/
+      - title: "시스템 아키텍처 (2) — 서비스 목록과 역할"
+        url: /infrastructure/home-lab-services/
+      - title: "K3s 클러스터 운영기"
+        url: /infrastructure/k3s-cluster-operation/
+      - title: "CI/CD 파이프라인 구축"
+        url: /infrastructure/homelab-cicd-pipeline/
+
+  - title: "🤖 LLM 서빙"
+    children:
+      - title: "DGX Spark 클러스터 구성"
+        url: /infrastructure/llm-serving-cluster/
+      - title: "로컬 LLM 모델 운영 변천사"
+        url: /infrastructure/llm-serving-models/
+      - title: "vLLM 업그레이드 기록"
+        url: /infrastructure/llm-serving-vllm-upgrade/
+
+  - title: "🛠️ AI 에이전트 개발"
+    children:
+      - title: "멀티 에이전트 오케스트레이션"
+        url: /development/multi-agent-orchestration/
+      - title: "에이전트 운영 규약 설계"
+        url: /development/harness-engineering-guidelines/
+      - title: "MCP 실전 활용기"
+        url: /development/mcp-practical-guide/
+      - title: "ATH 고도화 상세"
+        url: /development/ath-advanced-features/
