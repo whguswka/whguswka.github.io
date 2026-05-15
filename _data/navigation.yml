@@ -39,3 +39,5 @@ docs:
         url: /development/mcp-practical-guide/
       - title: "ATH 고도화 상세"
         url: /development/ath-advanced-features/
+      - title: "3-Way Fan-out 개발기 (hocg)"
+        url: /development/hocg-3way-fanout/
