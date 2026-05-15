@@ -1,6 +1,6 @@
 ---
 title: "LLM 서빙 인프라 (2) -- 모델 전환 여정과 운영 노하우"
-excerpt: "Qwen3-235B에서 MiniMax-M2.5를 거쳐 Qwen3.5-122B로 돌아오기까지, 6단계 모델 전환 과정에서 겪은 문제들과 llama.cpp, SGLang 시도기, tool calling 설정까지의 운영 경험을 정리합니다."
+excerpt: "Qwen3-235B에서 시작하여 397B int4-AutoRound에 이르기까지, 8단계 모델 전환 과정에서 겪은 문제들과 DeepSeek V4 Flash 호환성 실패, tool calling 설정까지의 운영 경험을 정리합니다."
 categories:
   - Infrastructure
 tags:
@@ -18,7 +18,7 @@ toc_sticky: true
 
 [이전 글](/infrastructure/llm-serving-cluster/)에서 DGX Spark 2노드 클러스터 구축 과정을 다뤘다. 이 글에서는 그 클러스터 위에서 어떤 모델들을 서빙했고, 왜 바꿨고, 어떤 문제를 만났는지를 정리한다.
 
-결론을 먼저 말하면, 현재는 **Qwen3.5-122B-A10B-FP8**을 **262K 컨텍스트**로 서빙하고 있다. 여기까지 오는 데 6단계의 모델 전환이 있었다. 가장 최근의 전환은 MiniMax-M2.5에서의 롤백이다.
+결론을 먼저 말하면, 현재는 **Qwen3.5-397B-A32B int4-AutoRound**를 **262K 컨텍스트**로 서빙하고 있다. 여기까지 오는 데 8단계의 모델 전환이 있었다. 가장 최근의 전환은 DeepSeek V4 Flash의 GPU 호환성 실패 후 397B int4로의 복귀다.
 
 ---
 
@@ -31,6 +31,9 @@ graph LR
     C -->|롤백| D["Qwen3.5-122B<br/>FP8<br/>262K ctx"]
     D --> E["MiniMax-M2.5<br/>AWQ 4-bit<br/>192K ctx"]
     E -->|롤백| F["Qwen3.5-122B<br/>FP8<br/>262K ctx"]
+    F --> G["Qwen3.5-397B<br/>int4-AutoRound<br/>262K ctx"]
+    G -.-> H["DeepSeek V4 Flash<br/>SM 12.1 비호환<br/>로딩 실패"]
+    H -->|롤백| G
     
     style A fill:#1a3a5c,stroke:#2e7bb5,color:#fff
     style B fill:#1a3a5c,stroke:#2e7bb5,color:#fff
@@ -38,6 +41,8 @@ graph LR
     style D fill:#2d5016,stroke:#4a8c2a,color:#fff
     style E fill:#8b0000,stroke:#ff4444,color:#fff
     style F fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style G fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style H fill:#8b0000,stroke:#ff4444,color:#fff
 ```
 
 ---
