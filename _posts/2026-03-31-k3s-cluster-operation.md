@@ -18,33 +18,33 @@ toc_sticky: true
 
 [홈랩 아키텍처 1편](/infrastructure/home-lab-architecture/)에서 인프라 전체 그림을 소개했다. 이 글에서는 그 중심에 있는 K3s 클러스터의 실제 구축과 운영 과정을 다룬다.
 
-이 글 작성 시점(2026년 3월) 기준으로, 클러스터는 112일째 운영 중이며 2개 노드(마스터 겸 워커 1, 워커 1) 위에 56개 네임스페이스, 60개 이상의 Deployment가 돌아가고 있다. 홈랩이라고 규모가 작지는 않다.
+이 글 작성 시점(2026년 3월) 기준으로, 클러스터는 112일째 운영 중이며 2개 노드(마스터 겸 워커 1, 워커 1) 위에 56개 네임스페이스, 60개 이상의 Deployment가 돌아간다. 홈랩이라 해도 규모가 작지는 않다.
 
 ```
 $ kubectl get nodes -o wide
-NAME          STATUS   ROLES                  AGE    VERSION        INTERNAL-IP
-hjjoserver1   Ready    control-plane,master   112d   v1.33.6+k3s1   192.168.0.156
-whguswka      Ready    worker                 90d    v1.33.6+k3s1   192.168.0.87
+NAME      STATUS   ROLES                  AGE    VERSION        INTERNAL-IP
+node-1    Ready    control-plane,master   112d   v1.33.6+k3s1   <master-ip>
+node-2    Ready    worker                 90d    v1.33.6+k3s1   <worker-ip>
 ```
 
 ---
 
 ## 왜 K3s인가
 
-처음에는 kubeadm으로 표준 Kubernetes를 올리려 했다. 하지만 홈랩 환경에서 다음 경험들이 걸렸다:
+처음에는 kubeadm으로 표준 Kubernetes를 구축하려 했다. 하지만 홈랩 환경에서 다음과 같은 점들이 우려됐다:
 
 - etcd 클러스터 관리 — 싱글 마스터인데 etcd를 별도로 관리할 필요가 있나?
 - CNI 플러그인 선택과 설치 — Calico? Cilium? 홈랩에서 eBPF까지 필요 없다
 - 인증서 갱신이 1년마다 찾아옴
 - kube-proxy, CoreDNS 등 개별 컴포넌트 업데이트
 
-K3s는 이 모든 것을 하나의 바이너리에 내장했다. SQLite(또는 내장 etcd) 기반 데이터스토어, Flannel CNI, CoreDNS, Traefik Ingress Controller가 기본 포함된다. 설치는 한 줄이다:
+K3s는 이 모든 기능을 하나의 바이너리에 담았다. SQLite(또는 내장 etcd) 기반 데이터스토어, Flannel CNI, CoreDNS, Traefik Ingress Controller가 기본으로 들어있다. 설치는 한 줄이면 된다:
 
 ```bash
 curl -sfL https://get.k3s.io | sh -
 ```
 
-다만 모든 것이 한 줄로 끝나지는 않았다. 실제로는 데이터 경로를 커스터마이징하고, kubelet 파라미터를 튜닝해야 안정적으로 운영할 수 있었다.
+다만 모든 일이 간단히 해결되지는 않았다. 실제로는 데이터 경로를 설정하고, kubelet 파라미터를 튜닝해야 안정적인 운영이 가능했다.
 
 ---
 
@@ -52,7 +52,7 @@ curl -sfL https://get.k3s.io | sh -
 
 ### 마스터 노드 설정
 
-기본 설치 후 커스터마이징이 필요한 부분은 `/etc/rancher/k3s/config.yaml`에 정리했다:
+기본 설치 후 커스터마이징이 필요한 내용은 `/etc/rancher/k3s/config.yaml`에 정리했다:
 
 ```yaml
 data-dir: /data/k3s
@@ -79,11 +79,11 @@ kubelet-arg:
 cat /var/lib/rancher/k3s/server/node-token
 
 # 워커에서
-curl -sfL https://get.k3s.io | K3S_URL=https://192.168.0.156:6443 \
+curl -sfL https://get.k3s.io | K3S_URL=https://<master-ip>:6443 \
   K3S_TOKEN=<node-token> sh -
 ```
 
-워커 노드가 `Ready` 상태가 되기까지 약 20초. kubeadm에서 인증서 교환, kubelet 설정, kube-proxy 배포까지 하나하나 셋업하던 것에 비하면 kubeadm 대비 훨씬 단순했다.
+워커 노드가 `Ready` 상태가 되기까지 약 20초가 걸렸다. kubeadm에서 인증서 교환, kubelet 설정, kube-proxy 배포를 일일이 셋업하던 방식보다 훨씬 단순했다.
 
 ---
 
@@ -91,21 +91,21 @@ curl -sfL https://get.k3s.io | K3S_URL=https://192.168.0.156:6443 \
 
 ### Flannel VXLAN
 
-K3s 기본 CNI인 Flannel은 VXLAN 모드로 동작한다. Pod 간 통신을 오버레이 네트워크로 처리하며, BGP 설정이나 네트워크 장비 연동 없이 즉시 작동한다.
+K3s 기본 CNI인 Flannel은 VXLAN 모드로 동작한다. Pod 간 통신을 오버레이 네트워크로 처리해서, BGP 설정이나 네트워크 장비 연동 없이 바로 작동한다.
 
-홈랩에서 Calico나 Cilium을 고려하기도 했지만, Network Policy 기반의 세밀한 트래픽 제어가 당장 필요하지 않았고, Flannel의 단순함이 트러블슈팅 시간을 절약해준다. 문제가 생겼을 때 "네트워크 문제인가, 애플리케이션 문제인가"의 판단이 빨라진다.
+홈랩에서 Calico나 Cilium을 고려하기도 했지만, Network Policy 기반의 세밀한 트래픽 제어가 당장 필요하지 않았고 Flannel의 단순함 덕분에 트러블슈팅 시간을 절약한다. 문제가 생겼을 때 "네트워크 문제인가, 애플리케이션 문제인가"를 더 빠르게 판단한다.
 
 ### NodePort 일변도 전략
 
-서비스 노출은 **전면 NodePort**를 사용한다. Ingress(Traefik)는 설치되어 있지만 Harbor 등 극소수 서비스에서만 사용하고, 나머지 28개 이상의 서비스는 모두 NodePort로 노출한다.
+서비스 노출은 **전면 NodePort**를 사용한다. Ingress(Traefik)가 설치되어 있으나 Harbor 등 극소수 서비스에서만 쓰며, 나머지 28개 이상의 서비스는 모두 NodePort로 노출한다.
 
 이 선택의 이유:
 
-- **직관적인 포트 관리**: `192.168.0.156:31085`가 GitLab임을 한눈에 알 수 있다
+- **직관적인 포트 관리**: `<server-ip>:<gitlab-port>`가 GitLab임을 한눈에 알 수 있다
 - **디버깅 용이**: curl로 바로 확인 가능. Ingress 경로 라우팅 문제를 배제할 수 있다
 - **내부망 전용**: 내부 네트워크 전용 서비스가 대부분이어서 현재는 HTTP로 운영 중이다
 
-다만 이 전략은 **내부 네트워크 전용이라는 전제**가 있어야 성립한다. 외부에 공개해야 하는 서비스에는 인증, HTTPS, 접근 제어를 별도로 구성해야 한다. 또한 포트 번호가 늘어나면서 충돌 관리가 필요해졌다. 현재 CLAUDE.md(에이전트 규칙 파일)에 전체 포트 할당표를 유지하고, 서비스 포털에서도 실시간으로 확인할 수 있도록 했다.
+다만 이 전략은 **내부 네트워크 전용이라는 전제**가 있어야 성립한다. 외부에 공개하는 서비스에는 인증, HTTPS, 접근 제어를 별도로 구성해야 한다. 포트 번호가 늘어나면서 충돌 관리도 필요해졌다. 현재 CLAUDE.md(에이전트 규칙 파일)에 전체 포트 할당표를 유지하며, 서비스 포털에서도 실시간으로 확인할 수 있게 했다.
 
 현재 할당된 주요 포트 범위:
 
@@ -121,7 +121,7 @@ K3s 기본 CNI인 Flannel은 VXLAN 모드로 동작한다. Pod 간 통신을 오
 
 ### 선택 이유
 
-Kubernetes에서 StatefulSet이나 데이터베이스를 운영하려면 PersistentVolume이 필요하다. 선택지는 크게 세 가지였다:
+Kubernetes에서 StatefulSet이나 데이터베이스를 운영하려면 PersistentVolume이 필요하다. 선택지는 크게 세 가지다.
 
 | 방식 | 장점 | 단점 |
 |------|------|------|
@@ -129,11 +129,11 @@ Kubernetes에서 StatefulSet이나 데이터베이스를 운영하려면 Persist
 | Longhorn | 복제, 스냅샷, 웹 UI | 약간의 오버헤드 |
 | Rook-Ceph | 엔터프라이즈급 | 리소스 소비 크고 복잡 |
 
-Longhorn을 택했다. 2노드밖에 없지만 데이터 복제(replica)가 가능하고, 웹 UI에서 볼륨 상태를 시각적으로 확인할 수 있으며, Helm 한 줄로 설치된다.
+Longhorn을 택했다. 2노드뿐이지만 데이터 복제가 가능하고, 웹 UI에서 볼륨 상태를 시각적으로 확인하며, Helm 한 줄로 설치한다.
 
 ### StorageClass 전략
 
-기본 `longhorn` StorageClass는 replica 3을 시도하지만, 2노드 환경에서 3개 복제는 불가능하다. 이를 위해 용도별로 StorageClass를 나눴다:
+기본 `longhorn` StorageClass는 replica 3을 시도하지만, 2노드 환경에서 3개 복제는 불가능하다. 그래서 용도별로 StorageClass를 나눴다.
 
 ```
 $ kubectl get sc
@@ -151,7 +151,7 @@ longhorn-static      driver.longhorn.io   Delete          Immediate           tr
 
 ### 운영 중 겪은 문제
 
-내 환경에서는 디스크 여유가 부족해질 때 Longhorn 볼륨이 `faulted` 상태로 가는 경우가 있었다. 한 번은 Harbor의 이미지 레지스트리(100GB PVC)가 차면서 클러스터 전체의 Longhorn 볼륨이 영향을 받은 적이 있다. 이후 Longhorn 설정에서 `storage-overprovisioning-percentage`를 보수적으로(100%) 잡고, Harbor의 Garbage Collection을 주기적으로 실행하도록 했다.
+내 환경에서는 디스크 여유 공간이 부족해지면 Longhorn 볼륨이 `faulted` 상태가 되곤 했다. 한 번은 Harbor 이미지 레지스트리(100GB PVC) 용량이 가득 차면서 클러스터 전체의 Longhorn 볼륨이 영향을 받았다. 이후 Longhorn 설정에서 `storage-overprovisioning-percentage`를 100%로 보수적으로 잡고, Harbor Garbage Collection을 주기적으로 실행하도록 했다.
 
 현재 PV 현황은 약 20개, 총 770GB 이상의 스토리지가 프로비저닝되어 있다.
 
@@ -161,7 +161,7 @@ longhorn-static      driver.longhorn.io   Delete          Immediate           tr
 
 ### 자체 레지스트리가 필요한 이유
 
-Docker Hub의 pull rate limit(익명: 100회/6시간)은 CI/CD에서 빈번히 이미지를 빌드하고 풀할 때 걸림돌이 된다. 또한 내부 네트워크에서 이미지를 풀하는 속도가 외부 대비 수십 배 빠르다.
+Docker Hub의 pull rate limit(익명: 100회/6시간)은 CI/CD 환경에서 빈번하게 이미지를 빌드하고 풀할 때 걸림돌이 된다. 내부 네트워크에서 이미지를 풀하는 속도는 외부보다 수십 배 빠르다.
 
 Harbor를 선택한 구체적인 이유:
 
@@ -178,7 +178,7 @@ harbor  harbor      1           deployed    harbor-1.18.1   2.14.1
 
 ### TLS 인증서 설정
 
-Harbor는 HTTPS가 기본이다. 자체 CA 인증서를 생성하여 K3s 노드와 CI/CD 파이프라인에서 신뢰하도록 설정했다. 나중에 CI/CD 글에서 더 자세히 다루겠지만, Kaniko 빌드 시 `--skip-tls-verify` 대신 CA 인증서를 명시적으로 추가하는 것이 보안상 올바른 방식이다.
+Harbor는 HTTPS가 기본이다. 자체 CA 인증서를 생성해 K3s 노드와 CI/CD 파이프라인에서 신뢰하도록 설정했다. 나중에 CI/CD 글에서 더 자세히 다루겠지만, Kaniko 빌드 시 `--skip-tls-verify` 대신 CA 인증서를 명시적으로 추가하는 방식이 보안상 올바르다.
 
 모든 서비스 이미지는 `harbor.local.cluster/library/<서비스명>:<버전>` 경로로 통일한다.
 
@@ -188,22 +188,22 @@ Harbor는 HTTPS가 기본이다. 자체 CA 인증서를 생성하여 K3s 노드�
 
 ### NVIDIA Device Plugin + Time-Slicing
 
-워커 노드(192.168.0.87)의 RTX 3090 하나를 가상 2개 GPU로 분할했다. NVIDIA GPU Time-Slicing은 물리 GPU를 시분할하여 여러 Pod이 공유하는 방식이다.
+워커 노드의 RTX 3090 하나를 가상 2개 GPU로 분할했다. NVIDIA GPU Time-Slicing은 물리 GPU를 시분할해 여러 Pod이 공유하는 방식이다.
 
 이 구성이 필요했던 이유:
 
 - **Ollama 임베딩 서비스**: 항시 가동. `nomic-embed-text` 모델로 텍스트 임베딩 처리
 - **ML 파이프라인 학습**: Kubeflow Recurring Run으로 일배치 실행. XGBoost GPU 학습
 
-두 워크로드가 동시에 물리 GPU를 점유하려 하면 OOM이 발생한다. Time-Slicing으로 `nvidia.com/gpu: 1`씩 요청하면 kubelet이 시간 단위로 GPU를 번갈아 할당한다. 다만 time-slicing은 물리적 분리(MIG)가 아니라 시분할이므로, 워크로드 간 간섭으로 지연시간과 처리량이 예측하기 어려워질 수 있다. 현재 구성에서는 임베딩 서비스가 경량이라 문제가 되지 않았다.
+두 워크로드가 동시에 물리 GPU를 점유하려 하면 OOM이 발생한다. Time-Slicing으로 `nvidia.com/gpu: 1`씩 요청하면 kubelet이 시간 단위로 GPU를 번갈아 할당한다. 다만 time-slicing은 물리적 분리(MIG)가 아니라 시분할 방식이라, 워크로드 간 간섭 때문에 지연시간과 처리량을 예측하기 어렵다. 현재 구성에서는 임베딩 서비스가 경량이라 문제가 되지 않았다.
 
-마스터 노드의 A6000(48GB)과 4090(24GB)은 주로 ComfyUI(이미지 생성)와 Kubeflow 노트북의 GPU 워크로드에 사용된다.
+마스터 노드의 A6000(48GB)과 4090(24GB)은 주로 ComfyUI(이미지 생성)와 Kubeflow 노트북의 GPU 워크로드를 처리한다.
 
 ---
 
 ## Rancher로 클러스터 관리
 
-K3s 위에 Rancher를 올려 웹 UI 기반 클러스터 관리를 한다.
+K3s 위에 Rancher를 설치해 웹 UI로 클러스터를 관리한다.
 
 ```
 $ helm list -n cattle-system
@@ -217,13 +217,13 @@ Rancher가 제공하는 가치:
 - 네임스페이스별 워크로드 현황을 대시보드로 파악
 - Helm 차트 배포를 GUI에서 관리
 
-다만 Rancher 자체가 상당한 리소스(cattle-system, cattle-fleet-system 등 10개 이상 네임스페이스)를 소비한다. 홈랩에서 Rancher가 과한 선택인지는 의견이 갈릴 수 있지만, 56개 네임스페이스를 터미널로만 관리하는 것은 현실적으로 어렵다.
+다만 Rancher 자체가 리소스를 상당히 소비한다(cattle-system, cattle-fleet-system 등 10개 이상 네임스페이스). 홈랩에서 Rancher가 과한 선택인지는 의견이 갈리겠지만, 56개 네임스페이스를 터미널로만 관리하는 것은 현실적으로 어렵다.
 
 ---
 
 ## Helm으로 관리하는 핵심 인프라
 
-현재 Helm으로 설치/관리 중인 서비스들:
+현재 Helm으로 설치하고 관리하는 서비스들:
 
 | Chart | Namespace | 용도 |
 |-------|-----------|------|
@@ -234,13 +234,13 @@ Rancher가 제공하는 가치:
 | traefik 37.1.1 | kube-system | Ingress Controller |
 | minio 5.4.0 | velero | 오브젝트 스토리지 (백업용) |
 
-이 외에 Kubeflow, OpenLDAP, GitLab 등은 직접 매니페스트(yaml) 배포 방식을 사용한다. Helm chart가 없거나, 커스터마이징이 과도해서 values.yaml로 제어하기 어려운 경우다.
+이 외에 Kubeflow, OpenLDAP, GitLab 등은 매니페스트(yaml)를 직접 배포하는 방식을 사용한다. Helm chart가 없거나, 커스터마이징이 과도해 values.yaml로 제어하기 어려운 경우다.
 
 ---
 
 ## 네임스페이스 설계
 
-56개 네임스페이스를 용도별로 분류하면 다음과 같다:
+56개 네임스페이스를 용도별로 분류한 결과는 다음과 같다:
 
 ```mermaid
 graph TD
@@ -310,7 +310,7 @@ kubectl get volumes.longhorn.io -n longhorn-system | grep -v healthy
 
 ### 백업
 
-Velero + MinIO 조합으로 클러스터 리소스와 PV 스냅샷을 백업한다. 다만 솔직히 말하면, 완전 자동화된 정기 백업보다는 대규모 변경 전 수동 백업 위주로 운영하고 있다. 이 부분은 개선이 필요하다.
+Velero + MinIO 조합으로 클러스터 리소스와 PV 스냅샷을 백업한다. 다만 솔직히 말하면, 완전 자동화된 정기 백업보다는 대규모 변경 전 수동 백업 위주로 운영 중이다. 이 부분은 개선해야 한다.
 
 ---
 
@@ -332,6 +332,6 @@ Velero + MinIO 조합으로 클러스터 리소스와 PV 스냅샷을 백업한�
 
 ## 마무리
 
-K3s는 홈랩 쿠버네티스의 진입 장벽을 극적으로 낮춰준다. 한 줄 설치, 한 줄 워커 추가, 내장 CNI와 Ingress Controller. 하지만 그 위에서 실제 서비스를 운영하면, 스토리지 관리, GPU 스케줄링, 네임스페이스 설계, 백업 전략 등 표준 Kubernetes와 동일한 운영 과제를 마주하게 된다.
+K3s는 홈랩 쿠버네티스의 진입 장벽을 낮춘다. 한 줄 설치, 한 줄 워커 추가, 내장 CNI와 Ingress Controller가 강점이다. 하지만 그 위에서 실제 서비스를 운영하면 스토리지 관리, GPU 스케줄링, 네임스페이스 설계, 백업 전략 등 표준 Kubernetes와 동일한 운영 과제를 마주하게 된다.
 
-다음 글에서는 이 K3s 클러스터 위에 구축한 [CI/CD 파이프라인](/infrastructure/homelab-cicd-pipeline/)을 다룬다. GitLab과 Kaniko로 Docker 데몬 없이 컨테이너 이미지를 빌드하고, Harbor에 push하고, 자동 배포까지 이어지는 흐름을 정리할 예정이다.
+다음 글에서는 이 K3s 클러스터 위에 구축한 [CI/CD 파이프라인](/infrastructure/homelab-cicd-pipeline/)을 다룬다. GitLab과 Kaniko로 Docker 데몬 없이 컨테이너 이미지를 빌드해 Harbor에 push하고, 자동 배포까지 이어지는 흐름을 정리한다.
