@@ -1,6 +1,6 @@
 ---
 title: "LLM 서빙 인프라 (2) -- 모델 전환 여정과 운영 노하우"
-excerpt: "Qwen3-235B에서 시작하여 397B int4-AutoRound에 이르기까지, 8단계 모델 전환 과정에서 겪은 문제들과 DeepSeek V4 Flash 호환성 실패, tool calling 설정까지의 운영 경험을 정리합니다."
+excerpt: "Qwen3-235B에서 시작해 DeepSeek V4 Flash 524K 서빙에 이르기까지, 9단계 모델 전환 과정에서 겪은 문제들과 SM 12.1 호환성 극복, tool calling 설정까지의 운영 경험을 정리합니다."
 categories:
   - Infrastructure
 tags:
@@ -9,6 +9,7 @@ tags:
   - llama.cpp
   - SGLang
   - Tool Calling
+  - DeepSeek
   - Home Lab
 toc: true
 toc_sticky: true
@@ -18,7 +19,7 @@ toc_sticky: true
 
 [이전 글](/infrastructure/llm-serving-cluster/)에서 DGX Spark 2노드 클러스터 구축 과정을 다뤘다. 이 글에서는 그 클러스터 위에서 어떤 모델들을 서빙했고, 왜 바꿨고, 어떤 문제를 만났는지를 정리한다.
 
-결론부터 말하면, 현재는 **Qwen3.5-397B-A32B int4-AutoRound**를 **262K 컨텍스트**로 서빙한다. 여기까지 오는 동안 8단계의 모델 전환이 있었다. 가장 최근에는 DeepSeek V4 Flash의 GPU 호환성 실패로 397B int4로 복귀했다.
+결론부터 말하면, 현재는 **deepseek-v4-flash**를 **524K 컨텍스트**로 서빙한다. 여기까지 오는 동안 9단계의 모델 전환이 있었다. 8단계에서 DeepSeek V4 Flash는 GB10의 GPU 호환성 문제로 로딩에 실패해 Qwen3.5-397B int4로 복귀했지만, 이후 SM 12.1 호환 포크 빌드와 메모리 튜닝으로 벽을 넘어 9단계에서 524K 컨텍스트 서빙으로 복귀했다.
 
 ---
 
@@ -34,6 +35,7 @@ graph LR
     F --> G["Qwen3.5-397B<br/>int4-AutoRound<br/>262K ctx"]
     G -.-> H["DeepSeek V4 Flash<br/>SM 12.1 비호환<br/>로딩 실패"]
     H -->|롤백| G
+    G -->|포크 빌드 재도전| I["DeepSeek V4 Flash<br/>524K ctx<br/>포크 빌드로 복귀"]
     
     style A fill:#1a3a5c,stroke:#2e7bb5,color:#fff
     style B fill:#1a3a5c,stroke:#2e7bb5,color:#fff
@@ -43,6 +45,7 @@ graph LR
     style F fill:#2d5016,stroke:#4a8c2a,color:#fff
     style G fill:#2d5016,stroke:#4a8c2a,color:#fff
     style H fill:#8b0000,stroke:#ff4444,color:#fff
+    style I fill:#2d5016,stroke:#4a8c2a,color:#fff
 ```
 
 ---
@@ -213,7 +216,7 @@ vLLM은 OpenAI 호환 API를 제공해서, 기존 OpenAI API 지원 도구의 �
 | 클라이언트 | 용도 |
 |-----------|------|
 | OpenWebUI | 웹 채팅 인터페이스 |
-| Hermes (5호기) | CLI 기반 에이전트 (Qwen3.5-397B, vLLM 직접 접속) |
+| Hermes (5호기) | CLI 기반 에이전트 (2026-07 기준 로컬 Ollama gemma4:31b 백엔드로 이전) |
 | Antigravity | IDE 통합 코딩 에이전트 |
 | Claude Code | CLI 기반 코딩 에이전트 |
 | JupyterLab (jupyter-ai) | 노트북 내 AI 어시스턴트 |
@@ -222,9 +225,9 @@ vLLM은 OpenAI 호환 API를 제공해서, 기존 OpenAI API 지원 도구의 �
 
 ---
 
-## 7단계: Qwen3.5-397B int4-AutoRound -- 현재 운영 모델
+## 7단계: Qwen3.5-397B int4-AutoRound -- 장기 운영 모델
 
-122B FP8를 안정적으로 운영한 경험을 바탕으로, 더 큰 모델로 확장을 시도했다. `Intel/Qwen3.5-397B-A32B-Instruct-int4-AutoRound`로 전환해 현재까지 안정적으로 운영하고 있다.
+122B FP8를 안정적으로 운영한 경험을 바탕으로, 더 큰 모델로 확장을 시도했다. `Intel/Qwen3.5-397B-A32B-Instruct-int4-AutoRound`로 전환해 이후 상당 기간 주력 모델로 안정적으로 운영했다(2026-06 DeepSeek V4 Flash로 전환하기 전까지 — 9단계 참고).
 
 ### 전환 이유
 
@@ -270,6 +273,53 @@ DGX Spark의 GB10 칩은 Blackwell 아키텍처 기반이지만 SM 버전이 12.
 
 ---
 
+## 9단계: DeepSeek V4 Flash -- 호환성 극복과 복귀 (2026-07 업데이트)
+
+8단계의 실패로 DeepSeek V4 Flash 서빙을 접었지만, 여기서 끝내지 않았다. 2026년 6월 재도전에서 두 개의 벽을 차례로 넘어 524K 컨텍스트 서빙에 성공했고, 2026-06-01부터 현재까지 이 모델을 운영하고 있다.
+
+### 문제 1: SM 12.1 비호환 -- 포크 빌드로 해결
+
+8단계에서 막혔던 GB10의 SM 12.1 비호환 문제는 커뮤니티 포크 빌드로 풀렸다. `jasl/vllm`의 `ds4-sm120-preview` 포크는 Blackwell SM 12.1을 겨냥해 커널을 빌드한 것으로, 이 이미지로 교체하자 8단계에서 커널 레벨 오류로 멈췄던 모델 로드가 정상적으로 완료됐다.
+
+호환성 벽은 넘었지만, 그것으로 서빙이 안정된 것은 아니었다. 더 까다로운 문제가 뒤이어 드러났다.
+
+### 문제 2: 524K에서 KV cache 포화 -- EngineDead
+
+DeepSeek V4 Flash의 강점은 524288 토큰(524K)에 달하는 초장문 컨텍스트다. 그런데 이 컨텍스트를 실제로 채우자 vLLM 엔진이 다운(EngineDead)되는 장애가 반복됐다.
+
+원인은 KV cache 메모리 포화였다. `gpu-memory-utilization`을 0.85 이상으로 두면, 524K 단일 요청이 들어올 때 KV cache가 약 95%까지 차오르며 엔진이 메모리를 확보하지 못하고 죽었다. UMA 환경이라 `nvidia-smi`로는 이 포화를 사전에 감지하기도 어려웠다(8단계 OOM 대응에서 겪은 것과 같은 한계다).
+
+### 의사결정: 메모리 상한을 낮추고 동시성을 희생
+
+해결의 핵심은 `gpu-memory-utilization`을 0.85에서 **0.80으로 하향**하는 것이었다. 상한을 낮추자 524K 단일 요청에서도 KV cache가 포화되지 않고 엔진이 안정적으로 버텼다.
+
+대신 트레이드오프가 있었다. 메모리 여유가 줄어든 만큼 동시에 처리할 수 있는 요청 수를 `max-num-seqs 4`로 제한해야 했다. 즉 **메모리 안정성을 얻는 대가로 동시성을 희생**한 것이다. 홈랩 환경에서는 동시 요청이 많지 않으므로, 엔진이 죽지 않는 안정성이 동시성보다 훨씬 가치 있다고 판단했다.
+
+### 결과: 524K 안정 서빙
+
+| 항목 | 값 |
+|------|-----|
+| 모델 | deepseek-v4-flash |
+| 컨텍스트 | 524288 tokens (524K) |
+| Tensor Parallel | 2 (Head + Worker) |
+| kv-cache-dtype | fp8 |
+| max-model-len | 524288 |
+| gpu-memory-utilization | 0.80 (안정성 핵심) |
+| max-num-seqs | 4 (동시성 제한) |
+| tool-call-parser | deepseek_v4 |
+| reasoning-parser | deepseek_v4 |
+| tokenizer parser | deepseek_v4 |
+
+2026-06-01 이후 이 구성으로 524K 컨텍스트를 안정적으로 서빙하고 있다. 이전 서빙 이미지(397B, 122B 계열)는 캐시에 보존해 두어, 문제 발생 시 언제든 되돌릴 수 있는 롤백 경로도 함께 유지했다.
+
+### 교훈
+
+- **실패는 종결이 아니라 중간 지점일 수 있다**: 8단계의 "SM 12.1 비호환"은 하드웨어의 절대적 한계가 아니라, 커뮤니티 포크 빌드로 넘을 수 있는 소프트웨어 벽이었다
+- **호환성과 안정성은 다른 문제다**: 로딩에 성공했다고 서빙이 안정된 것은 아니다. 컨텍스트를 최대로 밀어붙이면 메모리 포화라는 별개의 벽이 나타난다
+- **홈랩에서는 동시성보다 안정성**: 메모리 상한을 보수적으로 잡아 동시성을 희생하더라도, 엔진이 죽지 않는 편이 실사용에서 이득이다
+
+---
+
 ## 운영에서 배운 것들
 
 ### OOM 대응
@@ -312,8 +362,8 @@ DGX Spark 클러스터가 장애인 경우의 폴백 전략도 마련해두었�
 | Qwen3.5-397B | llama.cpp | MXFP4 | ~11.5 t/s | - | 불안정 | 속도 부족 |
 | Qwen3.5-122B | vLLM | FP8 | ~18 t/s | 262K | qwen3_coder | 안정적 |
 | MiniMax-M2.5 | vLLM | AWQ 4-bit | ~15 t/s | 192K | 전용 파서 | 문맥이해 부족 |
-| Qwen3.5-397B | vLLM | int4-AutoRound | ~12 t/s | 262K | qwen3_coder | **현재 운영** |
-| DeepSeek V4 Flash | vLLM | - | - | - | - | SM 12.1 비호환 |
+| Qwen3.5-397B | vLLM | int4-AutoRound | ~12 t/s | 262K | qwen3_coder | 안정적 (이전 운영) |
+| DeepSeek V4 Flash | vLLM | fp8 KV | - | 524K | deepseek_v4 | **현재 운영** |
 
 > 속도는 단일 사용자 기준 체감 수치이며, 프롬프트 길이와 생성 길이에 따라 달라진다.
 
@@ -323,10 +373,11 @@ DGX Spark 클러스터가 장애인 경우의 폴백 전략도 마련해두었�
 
 DGX Spark 두 대로 200B+ LLM을 로컬에서 서빙하는 것은 충분히 가능하다. 다만 데이터센터 GPU와 달리 UMA 기반이라 처리량이 제한적이고, ARM 아키텍처로 인한 소프트웨어 호환성 문제도 있다.
 
-8번의 모델 전환을 거치며 얻은 가장 큰 교훈은 세 가지다.
+9번의 모델 전환을 거치며 얻은 가장 큰 교훈은 네 가지다.
 
 1. **벤치마크 ≠ 실사용 품질**: SWE-Bench 점수가 높아도 문맥 이해, 코드 오류율, 언어 일관성 등 실사용 지표에서 떨어지면 생산성이 오히려 낮아진다
 2. **기능 안정성 > 모델 규모**: 229B 모델보다 122B 모델이 실제 작업에서 더 나은 결과를 낼 수 있다. 모델 크기가 아닌, 사용자 지시 이행 정확도와 출력 품질의 일관성이 핵심이다
 3. **하드웨어 호환성 사전 검증**: GPU SM 버전, CUDA Compute Capability 등 하드웨어 레벨의 호환성을 모델 전환 전에 반드시 확인해야 한다
+4. **실패가 곧 종결은 아니다**: 8단계의 SM 12.1 호환성 실패는 끝이 아니었다. 포크 빌드와 메모리 튜닝으로 호환성 벽을 넘어 9단계에서 DeepSeek V4 Flash 524K 서빙에 도달했다
 
-현재 Qwen3.5-397B int4-AutoRound + vLLM 조합은 262K 컨텍스트, tool calling, reasoning을 모두 안정적으로 지원하며, 6개의 AI 에이전트가 동시에 사용하는 환경에서 실용적으로 동작한다.
+현재 deepseek-v4-flash + vLLM 조합은 524K 컨텍스트, tool calling, reasoning을 모두 안정적으로 지원하며, 여러 AI 에이전트가 동시에 사용하는 환경에서 실용적으로 동작한다.

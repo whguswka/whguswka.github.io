@@ -12,6 +12,7 @@ tags:
   - Blackwell
   - Ray
   - TurboQuant
+  - DeepSeek
 toc: true
 toc_sticky: true
 ---
@@ -99,7 +100,7 @@ DGX Spark 2노드로 397B 모델을 서빙하려면 **Tensor Parallelism(TP)**�
 
 vLLM은 [Ray](https://docs.ray.io/)를 분산 실행 백엔드로 사용한다. Ray는 Python 기반 분산 컴퓨팅 프레임워크이며, 주요 개념은 다음과 같다.
 
-- **Ray Cluster**: Head 노드(스케줄러)와 Worker 노드(실행기)로 구성된다. 우리 환경에서는 228이 Head, 237이 Worker다
+- **Ray Cluster**: Head 노드(스케줄러)와 Worker 노드(실행기)로 구성된다. 우리 환경에서는 한 노드가 Head, 다른 노드가 Worker다
 - **Placement Group**: GPU, CPU 같은 리소스를 논리적으로 묶어 예약하는 단위다. vLLM은 TP 수만큼의 GPU를 placement group으로 예약하여 다른 프로세스가 사용하지 못하게 보호한다
 - **Actor**: Ray에서 상태를 가진 원격 객체다. vLLM은 각 GPU에서 실행되는 `RayWorkerWrapper`를 Actor로 생성하여 모델 추론을 수행한다
 
@@ -119,7 +120,7 @@ vLLM 0.18.1rc1.dev222
 컨텍스트: 262,144 tokens (262K)
 KV Cache: FP8
 GPU 메모리: 112GB
-Tensor Parallel: 2 (228 Head + 237 Worker)
+Tensor Parallel: 2 (Head + Worker)
 ```
 
 OpenClaw(디스코드 봇 에이전트)로 정상 동작을 확인했다. tool calling과 reasoning 모두 정상이었다.
@@ -252,13 +253,13 @@ DGX Spark은 UEFI GRUB을 사용한다. 이전 커널(`6.17.0-1008-nvidia`)이 �
 DGX Spark의 GRUB 메뉴는 submenu 구조라 단순한 `GRUB_DEFAULT=2` 같은 인덱스로는 동작하지 않는다. menuentry ID를 `submenu>entry` 형식으로 지정해야 한다:
 
 ```bash
-# 228 서버 (UUID: 66606008...)
-sudo grub-set-default "gnulinux-advanced-66606008-...>gnulinux-6.17.0-1008-nvidia-advanced-66606008-..."
+# Head 노드 (디스크 UUID는 노드마다 다름)
+sudo grub-set-default "gnulinux-advanced-<DISK-UUID>-...>gnulinux-6.17.0-1008-nvidia-advanced-<DISK-UUID>-..."
 sudo sed -i "s/GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/" /etc/default/grub
 sudo update-grub
 
-# 237 서버 (UUID: 08692ac5...) -- 디스크 UUID가 다르므로 주의
-sudo grub-set-default "gnulinux-advanced-08692ac5-...>gnulinux-6.17.0-1008-nvidia-advanced-08692ac5-..."
+# Worker 노드 (디스크 UUID는 노드마다 다르므로 주의)
+sudo grub-set-default "gnulinux-advanced-<DISK-UUID>-...>gnulinux-6.17.0-1008-nvidia-advanced-<DISK-UUID>-..."
 sudo sed -i "s/GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/" /etc/default/grub
 sudo update-grub
 ```
@@ -270,8 +271,8 @@ sudo update-grub
 양 노드 재부팅 후 `uname -r`로 커널을 확인한다.
 
 ```
-228: 6.17.0-1008-nvidia ✅
-237: 6.17.0-1008-nvidia ✅
+Head 노드: 6.17.0-1008-nvidia ✅
+Worker 노드: 6.17.0-1008-nvidia ✅
 ```
 
 vLLM을 기본 파라미터로 실행하니 **12분 만에 262K 컨텍스트로 서빙이 시작**되었다. `--enforce-eager` 옵션 없이도 CUDA 그래프 컴파일이 정상적으로 완료되었다.
@@ -360,6 +361,67 @@ Restart=on-failure`는 편리하지만, 실패 원인이 리소스 경합(placem
 ---
 
 이 글 작성 시점(2026년 3월) 기준으로 커널 롤백 후 수일간 안정적으로 동작하며, AI 코딩 에이전트(OpenClaw)에서 397B 모델을 262K 컨텍스트로 활용한다.
+
+---
+
+## (2026-07 업데이트) DeepSeek V4 Flash로의 전환
+
+위 기록은 2026년 3월, Qwen3.5-397B를 262K 컨텍스트로 안정화한 시점의 상태다. 이후 DGX Spark 클러스터의 서빙 모델은 **DeepSeek V4 Flash**(컨텍스트 524K)로 바뀌었다. 전환일은 2026-06-01이다. 여기서는 그 전환 과정에서 다시 부딪힌 호환성 문제와 안정화 방법을 정리한다.
+
+### 다시 꺼낸 DeepSeek V4 Flash -- SM 12.1 비호환
+
+DeepSeek V4 Flash는 이 클러스터에서 처음 시도한 모델이 아니다. 앞서 한 차례 올리려다 **GB10의 SM 12.1(Blackwell) 비호환**으로 vLLM 로딩 단계에서 실패했고, 그래서 당시에는 Qwen3.5-397B로 되돌렸던 이력이 있다. 컴퓨트 커널이 대상 아키텍처(SM 12.1)를 지원하지 않으면 모델 가중치를 적재하기도 전에 초기화가 멈춘다.
+
+이번에는 접근을 바꿔, SM 12.1 대응이 들어간 **jasl/vllm의 `ds4-sm120-preview` 포크 빌드**를 사용했다. 이 포크는 Blackwell 세대(SM 12.1) 커널 호환성을 확보한 프리뷰 빌드로, 공식 릴리스에 앞서 GB10에서 DeepSeek V4 Flash를 적재할 수 있게 해준다. 이 빌드로 기동하니 로딩 실패 없이 524K 컨텍스트까지 정상적으로 올라갔다.
+
+### 안정화 -- gpu-memory-utilization 0.80과 EngineDead
+
+기동에 성공했다고 끝이 아니었다. 524K는 매우 긴 컨텍스트라 KV 캐시 압력이 크다. `--gpu-memory-utilization`을 0.85 이상으로 두면, **524K 단일 요청 하나만으로도 KV 캐시가 약 95%까지 포화**되어 vLLM 엔진이 다운(EngineDead)됐다.
+
+397B 서빙에서는 UMA 환경의 비율 파라미터 불확실성 때문에 절대값 파라미터(`--gpu-memory-utilization-gb`)를 썼지만, 이번 포크 빌드 기반 구성에서는 비율 파라미터(`--gpu-memory-utilization`)를 그대로 두되 값을 **0.80**으로 보수적으로 낮춰 KV 포화를 회피했다. 트레이드오프로 동시 처리 슬롯을 `--max-num-seqs 4`로 제한했다. 긴 컨텍스트의 안정성을 확보하는 대신 동시 요청 처리량을 양보한 셈이다.
+
+```bash
+--gpu-memory-utilization 0.80   # 0.85+ 에서 524K KV 포화 → EngineDead
+--max-num-seqs 4                # 동시 요청 수 제한 (트레이드오프)
+```
+
+### 롤백 안전망
+
+전환 과정에서 이전 서빙 이미지(397B, 122B 계열)는 캐시로 보존했다. 새 포크 빌드에 문제가 생기면 언제든 이전 모델 구성으로 되돌릴 수 있도록 안전망을 남겨둔 것이다. 커널 롤백 사례에서 배운 대로, "직전에 동작하던 상태로 즉시 되돌아갈 수 있는 경로"를 항상 확보해 두는 원칙을 유지했다.
+
+### 최종 구성 (2026-07)
+
+| 항목 | 값 |
+|------|-----|
+| 모델 | deepseek-v4-flash |
+| 컨텍스트 | 524,288 tokens (524K) |
+| KV 캐시 | FP8 (`--kv-cache-dtype fp8`) |
+| max-model-len | 524288 |
+| gpu-memory-utilization | 0.80 |
+| max-num-seqs | 4 |
+| Tensor Parallel | 2 (Head + Worker) |
+| Tokenizer / Tool Call / Reasoning 파서 | 모두 `deepseek_v4` |
+| vLLM 빌드 | jasl/vllm `ds4-sm120-preview` 포크 (SM 12.1 대응) |
+| 전환일 | 2026-06-01 |
+
+```mermaid
+graph LR
+    A["Qwen3.5-397B<br/>INT4<br/>262K ctx"] -->|DeepSeek V4 Flash<br/>재시도| B["로딩 실패<br/>GB10 SM 12.1<br/>비호환"]
+    B -->|jasl/vllm<br/>ds4-sm120-preview 포크| C["DeepSeek V4 Flash<br/>524K ctx<br/>기동 성공"]
+    C -->|gpu-mem-util 0.85+<br/>KV 약 95% 포화| D["EngineDead"]
+    D -->|0.80 + max-num-seqs 4| E["DeepSeek V4 Flash<br/>524K ctx ✅"]
+
+    style A fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style B fill:#8b0000,stroke:#ff4444,color:#fff
+    style C fill:#1a3a5c,stroke:#2e7bb5,color:#fff
+    style D fill:#8b0000,stroke:#ff4444,color:#fff
+    style E fill:#2d5016,stroke:#4a8c2a,color:#fff
+```
+
+### 이번 전환의 교훈
+
+- **하드웨어 세대 호환성은 포크/프리뷰 빌드로 앞당길 수 있다.** GB10(SM 12.1) 같은 신세대 아키텍처는 공식 릴리스가 따라오기 전까지 로딩조차 안 되는 경우가 있는데, 커뮤니티 포크가 그 간극을 메워준다. 다만 프리뷰 빌드는 안정성 검증 책임이 사용자에게 넘어온다.
+- **KV 포화 경계는 실측으로 좁혀야 한다.** 긴 컨텍스트일수록 `--gpu-memory-utilization`의 안전 마진이 좁아진다. 0.85와 0.80의 차이가 "정상 서빙"과 "EngineDead"를 가른다면, 그 경계는 문서가 아니라 실제 기동 테스트로만 찾을 수 있다.
 
 ---
 
@@ -456,7 +518,7 @@ for mod in "${MOD_PATHS[@]}"; do
 done
 
 # Ray 클러스터 시작
-ray start --head --port 29501 ...           # Head 노드
+ray start --head --port <RAY-PORT> ...       # Head 노드
 ssh $worker "docker exec vllm_node ray start --address=..."  # Worker 노드
 ```
 

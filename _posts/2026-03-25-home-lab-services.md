@@ -63,9 +63,11 @@ Kubeflow[^kubeflow] 워크스페이스 엔드유저 접근성을 개선하려고
 
 셀프 호스팅 방식의 오픈소스 메타 검색 엔진이다. 내부망의 멀티 AI 에이전트가 웹 검색 API를 호출할 때 외부 써드파티 검색 엔진의 쿼리 로깅을 우회하고 자체 크롤링 트래픽을 처리하는 프록시 역할을 한다.
 
-### ComfyUI
+### ComfyUI (2026-06-07 폐기)
 
-Stable Diffusion 모델 기반의 이미지 생성 파이프라인을 노드 시퀀스로 제어하는 도구다. VRAM 점유 최적화를 위해 GPU Time-slicing이 적용된 Worker 노드에서 전용 컨테이너로 격리되어 구동된다.
+Stable Diffusion 모델 기반의 이미지 생성 파이프라인을 노드 시퀀스로 제어하는 도구다. VRAM 점유 최적화를 위해 GPU Time-slicing이 적용된 Worker 노드에서 전용 컨테이너로 격리되어 구동되었다.
+
+이미지 생성 워크로드는 실사용 빈도가 낮은 반면 로딩된 확산 모델이 VRAM을 상시 점유했다. GPU 자원을 LLM 추론 워크로드에 집중하기로 결정하고 2026-06-07 폐기했다. (폐기·전환 이력은 하단 "서비스 구성 현행화" 절 참조)
 
 ---
 
@@ -83,6 +85,10 @@ Stable Diffusion 모델 기반의 이미지 생성 파이프라인을 노드 시
 - **Auto-healing 로직 적용**: 헬스체크 타임아웃 이벤트 발생 시 타겟 파드의 재시작을 트리거하며 연속 복구 실패 시에만 관리자 알림을 발송한다. 코어 인프라 제어 영역 파드는 트리거 대상에서 하드코딩으로 예외 처리되어 시스템 락아웃을 방지한다.
 
 고빈도의 상태 데이터 갱신 처리를 위해 프론트엔드 계층은 React[^react]를 기반으로 구축했다. 분산된 AI 에이전트들이 인프라 상태를 참조하면 표준 MCP(Model Context Protocol) 통신 규약으로 해당 포털의 매트릭 메타데이터를 연동받도록 설계했다.
+
+### Monitoring MCP (관제 데이터 MCP 게이트웨이)
+
+Service Portal과 Log Analyzer가 수집한 관제 데이터를 MCP(Model Context Protocol) 규약으로 재노출하는 전용 게이트웨이다. 초기에는 각 에이전트가 관제 정보를 얻으려면 포털의 REST 엔드포인트를 개별 호출하고 응답 스키마를 매번 파싱해야 했다. 파드 상태·헬스체크 결과·리소스 매트릭을 MCP 리소스/툴로 표준화해 노출하자, 에이전트는 별도 어댑터 코드 없이 동일한 프로토콜로 인프라 상태를 조회하게 됐다.
 
 ### Agent Task Hub (ATH)
 
@@ -103,6 +109,10 @@ ATH의 상세 고도화 과정은 [별도 아티클](/development/ath-advanced-f
 
 ATH에 축적된 데이터를 시각화하는 Streamlit 기반 모니터링 환경이다. 에이전트 포커스 현황, 상태별 Task 관리 내역, 실시간 최신 Knowledge 현황, 교차 검증 이력 및 에이전트 로그를 시각화해 종합적으로 오케스트레이션을 관제한다.
 
+### Tech Radar API (기술 레이더)
+
+에이전트나 사람이 새로 발견한 기술 후보를 평가·추적하는 레지스트리 서비스다. 봇이 링크를 분석해 적재할 때는 항상 assess(평가 대기) 상태로만 기록하고, trial·adopt로 승격하는 순간에만 사람이 ATH Task를 생성해 역링크하도록 워크플로우를 분리했다. 탐색 단계의 후보 기술이 검증 없이 곧장 실행 작업 이력(ATH)을 오염시키는 것을 막는 staging 계층이다.
+
 ### ArgoCD (GitOps 동기화)
 
 K3s 클러스터의 선언적 상태 관리를 위해 도입한 GitOps 도구다. Git 리포지토리 매니페스트를 Single Source of Truth로 설정해, 클러스터 상태와의 Drift를 자동 감지하고 동기화한다.
@@ -113,7 +123,7 @@ K3s 클러스터의 선언적 상태 관리를 위해 도입한 GitOps 도구다
 
 ### Ops Intel (운영 정보 수집기)
 
-에이전트 작업에 필요한 운영 정보(K8s 리소스, 파드 상태, 로그 등)를 자동으로 수집해 ATH 지식베이스에 적재하는 데이터 수집 에이전트다.
+에이전트 작업에 필요한 운영 정보(K8s 리소스, 파드 상태, 로그 등)를 자동으로 수집해 ATH 지식베이스에 적재하는 데이터 수집 에이전트다. 수집 현황과 적재 결과를 사람이 확인할 수 있도록 별도의 웹 UI(Ops Intel UI)를 함께 제공한다.
 
 ### Log Analyzer (통합 로그 분석 컨트롤러)
 
@@ -167,9 +177,21 @@ Teradata Native Vector 쿼리 활용성을 검증하는 PoC(Proof of Concept) �
 
 로컬 LLM 기반 에이전트(OpenClaw)의 컨텍스트 추론 성능을 보강하려고 구축한 MCP 서버다. 에이전트가 작업 시작 전 ATH 지식베이스, Wiki 문서, 시스템 상태 등 관련 정보를 자동으로 수집해 프롬프트에 주입하는 RAG 레이어 역할을 한다.
 
-### Stock Prediction Dashboard
+### TEI Reranker (RAG 리랭커)
 
-시계열 예측 ML 파이프라인 결과를 시각화하는 Streamlit 기반 대시보드다. TensorBoard와 연동해 모델 학습 매트릭을 모니터링하고 예측 결과를 비교 분석할 수 있는 환경을 제공한다.
+RAG 파이프라인에서 1차 벡터 검색으로 회수한 후보 문서를 질의와의 실제 관련도 기준으로 재정렬(re-ranking)하는 추론 서버다. 임베딩 유사도만으로는 상위 후보의 정밀도가 부족한 경우가 있어, 크로스 인코더 계열 리랭커를 별도 스테이지로 두어 최종 컨텍스트 품질을 끌어올린다. ATH 지식 검색과 OpenClaw RAG MCP가 공통으로 참조한다.
+
+### Humanize API (한글 윤문)
+
+LLM이 생성한 한글 산출물의 번역투·기계적 병렬·피동태 남용 등 이른바 "AI 티" 패턴을 탐지해 자연스러운 문체로 다듬는 윤문 API다. 내용은 바꾸지 않고 문체·리듬·표현만 재작성하는 것을 원칙으로, 블로그 초안이나 문서 산출물의 후처리 단계에 붙인다.
+
+### LLM Docs (LLM 라우터 문서)
+
+클러스터 내부에서 제공하는 LLM 엔드포인트와 라우팅 규칙을 정리한 참조 문서 서비스다. 어떤 모델이 어느 백엔드(vLLM/Ollama)에 매핑되는지, 컨텍스트 한도와 용도는 무엇인지를 소비자(에이전트·개발자)가 한곳에서 확인하도록 한다. 뒤에서 다룰 LiteLLM 프록시 제거 이후, 직결 구성에서 "어디에 무엇이 있는지"를 잃지 않기 위한 문서 계층이다.
+
+### Stock Prediction Dashboard (2026-04-15 폐기)
+
+시계열 예측 ML 파이프라인 결과를 시각화하는 Streamlit 기반 대시보드다. TensorBoard와 연동해 모델 학습 매트릭을 모니터링하고 예측 결과를 비교 분석할 수 있는 환경을 제공했다. 예측 파이프라인 자체가 수익 창출이 아니라 In-Database 연산과 애플리케이션 계층 연산의 성능 프로파일링을 목적으로 한 만큼, 프로파일링 지표 수집을 마친 뒤 시각화 대시보드는 2026-04-15 폐기했다. (데이터 수집 배치와 예측 파이프라인 프로파일링 워크로드는 유지)
 
 ### DGX Dashboard (DGX Spark 클러스터 모니터링)
 
@@ -191,6 +213,7 @@ graph LR
 
     subgraph AdminServices["관리용 서비스"]
         SP[Service Portal]
+        MON[Monitoring MCP]
         ATH[Agent Task Hub]
         ATHD[ATH Dashboard]
         DGXD[DGX Dashboard]
@@ -199,7 +222,7 @@ graph LR
     subgraph DataML["데이터/ML 일괄 처리"]
         KFP[Kubeflow Pipelines]
         COL[Data Collectors]
-        STK[Stock Prediction<br/>Dashboard]
+        RRK[TEI Reranker]
     end
 
     subgraph AgentInfra["에이전트 인프라"]
@@ -227,24 +250,54 @@ graph LR
     SP --> LDAP
     SP --> KC
     SP --> PG
+    SP --> MON
     ATH --> PG
     ATHD --> ATH
     DGXD -.-> VLLM
     RAGMCP --> ATH
     RAGMCP --> VLLM
+    RAGMCP --> RRK
     KFP --> PG
     KFP --> TD
     COL --> PG
-    STK --> TD
 
     style AP fill:#1a5276,stroke:#2e86c1,color:#fff
     style SP fill:#1a5276,stroke:#2e86c1,color:#fff
+    style MON fill:#1a5276,stroke:#2e86c1,color:#fff
     style ATH fill:#4a235a,stroke:#7d3c98,color:#fff
     style ATHD fill:#4a235a,stroke:#7d3c98,color:#fff
     style DGXD fill:#4a235a,stroke:#7d3c98,color:#fff
     style VLLM fill:#5c1a5c,stroke:#9b2d9b,color:#fff
     style RAGMCP fill:#2d5016,stroke:#4a8c2a,color:#fff
 ```
+
+---
+
+## 서비스 구성 현행화 (2026-07)
+
+초판 이후 서비스 구성에 적지 않은 변화가 있었다. 신규 서비스 도입 외에도 폐기·내부 전환·프록시 제거 같은 "덜어내는" 결정들이 이어졌다. 배경과 트레이드오프를 정리한다.
+
+### 프록시 레이어 제거 — LiteLLM
+
+도입 초기에는 클러스터의 모든 LLM 트래픽을 LiteLLM 프록시 한 곳으로 모아 모델 라우팅과 사용량 로깅을 중앙화했다. 편의는 있었지만, 프록시가 모든 추론 요청의 경유지가 되면서 단일 장애점이자 지연 구간이 됐다. 프록시가 흔들리면 이를 참조하는 모든 소비자(OpenWebUI, 에이전트, 배치)가 함께 영향을 받았다.
+
+2026-06-17, 소비자들을 Ollama/vLLM 엔드포인트에 직결하는 방식으로 전환하며 LiteLLM 프록시를 제거했다. 중앙 라우팅·통합 로깅의 편의를 포기하는 대신, 장애 전파 경로를 하나 없애고 호출 경로를 단순화해 안정성을 확보했다. 직결 구성에서 "어떤 모델이 어디에 있는지"를 잃지 않도록 앞서 소개한 LLM Docs 문서 계층으로 라우팅 정보를 대체했다.
+
+### 삭제가 아니라 내부 전환 — NodePort 해제
+
+CouchDB, Prometheus, Kubeflow Central Dashboard는 한동안 외부 접근용 NodePort로 노출돼 있었으나, 실제로는 클러스터 내부 컴포넌트만 소비하는 서비스였다. 이들의 외부 노출을 해제하고 내부 전용(ClusterIP)으로 전환했다. 서비스를 삭제한 것이 아니라 외부 노출면만 없앤 것으로, 세 서비스 모두 내부에서 정상 운영 중이다.
+
+특히 Prometheus는 이 원칙이 잘 드러나는 사례다. 메트릭 수집기(Prometheus)는 외부에서 직접 접근할 이유가 없으므로 내부로 감추고, 사람이 실제로 들여다보는 시각화 계층(Grafana)만 외부 접근을 허용했다. 노출면을 "봐야 하는 것"으로 최소화해 공격 표면을 줄이는 보안 강화 조치다.
+
+### 폐기한 서비스
+
+- **ComfyUI** (2026-06-07): 이미지 생성 워크로드의 실사용 빈도 대비 상시 VRAM 점유가 커, GPU를 LLM 추론에 집중하기로 하고 폐기했다.
+- **Stock Prediction Dashboard** (2026-04-15): 예측 파이프라인의 성능 프로파일링 목적을 달성한 뒤 시각화 대시보드를 폐기했다. 데이터 수집 배치와 프로파일링 워크로드는 유지한다.
+
+### 스토리지 인프라 확충
+
+- **Longhorn 백업 스토어**: 분산 블록 스토리지(Longhorn) 볼륨의 스냅샷·백업을 적재하는 백업 타깃을 구성해, 스테이트풀 워크로드의 복구 지점을 확보했다.
+- **MinIO 테넌트**: Kubeflow 내장 오브젝트 스토리지와 분리된 독립 S3 호환 스토리지를 별도 테넌트로 운영한다. 파이프라인 아티팩트 스토리지와 범용 오브젝트 스토리지의 생명주기·장애 도메인을 분리하는 것이 목적이다.
 
 ---
 
@@ -268,6 +321,7 @@ graph LR
 | 2026-04-08 | Zero Trust 보안 아키텍처 및 PII 마스킹 내용 반영, 전문적 어투로 리팩토링 |
 | 2026-04-13 | 신규 서비스 4종 추가(ATH Dashboard, DGX Dashboard, OpenClaw RAG MCP, Stock Prediction Dashboard), ATH PostgreSQL 전환/시맨틱 검색/신뢰도 관리/Wiki 컴파일러 등 고도화 내용 반영, Mermaid 다이어그램 갱신 |
 | 2026-05-15 | 서비스 수 100개 이상으로 갱신, 신규 제어 영역 서비스(ArgoCD, Rancher, Ops Intel) 추가, 에이전트 6개 체제 반영 |
+| 2026-07-06 | 서비스 구성 현행화 — 신규 서비스(Monitoring MCP, Tech Radar API, TEI Reranker, Humanize API, LLM Docs) 추가, LiteLLM 프록시 제거 및 Ollama/vLLM 직결 전환, NodePort 해제(CouchDB·Prometheus·Kubeflow Central Dashboard 내부 전용화), ComfyUI·Stock Prediction Dashboard 폐기 반영, 스토리지 인프라(Longhorn 백업 스토어·MinIO 테넌트) 추가, Mermaid 다이어그램 갱신 |
 
 ---
 

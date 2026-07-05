@@ -2,7 +2,7 @@
 title: "멀티 에이전트를 홈랩에 풀어놓으면 생기는 일 — Agent Task Hub 개발기"
 date: 2026-03-27
 categories: [development]
-tags: [homelab, multi-agent, ai, orchestration, ath, claude, gemini]
+tags: [homelab, multi-agent, ai, orchestration, ath, claude, gemini, codex]
 toc: true
 toc_sticky: true
 ---
@@ -29,6 +29,8 @@ toc_sticky: true
 | Hermes (5호기) | Qwen3.5-397B (vLLM, 자체 호스팅) | 깊은 추론, 긴 컨텍스트, 아키텍처 평가 | CLI 기반 |
 
 과거에는 WSL 환경의 별도 에이전트 등 다양한 체계를 실험했지만, 역할과 모델 특성을 기준으로 에이전트를 분화한 현재의 6노드 구성으로 정착했다. 특히 자체 호스팅 LLM(Hermes) 도입과 Oh-My-OpenAgent를 통한 다중 모델 라우팅(OpenCode/omo)이 주요 전환점이 됐다.
+
+> **(2026-07 업데이트)** 위 표는 2026-05 시점의 구성이다. 이후 DGX Spark 서빙 모델이 `deepseek-v4-flash`로 전환되면서 Hermes 백엔드가 로컬 Ollama `gemma4:31b`로 강등됐고, 이에 따라 뒤에서 다루는 다관점 합성(hocg)의 워커 구성도 재편됐다. 자세한 내용은 아래 "4-Way Fan-out으로의 재편" 절에서 다룬다.
 
 ---
 
@@ -332,7 +334,7 @@ Claude Code(3호기)가 사용자 요청을 분석해 세 워커에게 동시에
 외부 워커 호출 시 무한 대기를 막으려고 다층 타임아웃 구조를 적용했다.
 
 - 각 워커별 `timeout --kill-after` 로 SIGTERM 후 SIGKILL 강제 종료
-- 전체 데드라인 watchdog로 취총 시간 상한 보장
+- 전체 데드라인 watchdog로 총 시간 상한 보장
 - SSH 연결 전 도달성 사전 검증(OpenClaw)
 
 ### Graceful Degradation
@@ -349,6 +351,43 @@ Claude Code(3호기)가 사용자 요청을 분석해 세 워커에게 동시에
 - **코드 변경 부적합**: 다관점 합성은 의사결정이나 리뷰에 적합하지만, 실제 코드를 수정해야 하는 작업에는 적합하지 않다.
 - **쿼터 분산**: omo 워커의 Kimi/GPT 호출은 유료 쿼터를 소모하므로, 빈번한 호출 시 비용 관리가 필요하다.
 - **합성 품질 의존성**: 최종 결과물의 품질이 Claude Code의 합성 능력에 크게 의존하며, 워커 응답의 포맷이 다양할 경우 통합 난도가 상승한다.
+
+### (2026-07 업데이트) 4-Way Fan-out으로의 재편
+
+앞서 짚은 "Hermes 초기 로딩 병목"과 워커 모델 편중 문제는 이후 fleet 구성을 바꾸는 계기가 됐다.
+
+**문제.** 2026-06-01 DGX Spark 서빙 모델이 `deepseek-v4-flash`(컨텍스트 524K)로 전환되면서, Hermes 워커의 백엔드가 자체 호스팅 vLLM(397B급)에서 로컬 Ollama `gemma4:31b`로 강등됐다. 추론 품질이 떨어지자 fan-out 결과에서 워커 간 품질 편차가 눈에 띄게 커졌다. 다관점 합성은 각 워커가 비슷한 수준의 답을 내놓을 때 가치가 있는데, 한 워커의 품질이 처지면 합성 단계에서 오히려 잡음으로 작용했다.
+
+**결정.** 2026-06-16 Hermes를 hocg 워커에서 제외했다. 대신 이종 모델 풀을 넓히려고 서로 다른 계열의 외부 워커를 합류시켰다 — 2026-06-28 Antigravity(Google Gemini 계열), 2026-07-02 Codex(GPT-5.x 계열). 그 결과 hocg는 3-Way에서 4-Way로 재편됐다.
+
+현재 구성은 다음과 같다.
+
+```mermaid
+graph LR
+    U["사용자 요청"] --> CC["Claude Code\n(3호기, 합성자)"]
+    CC --> |"Prompt A"| OMO["OpenCode (omo)\nKimi 계열"]
+    CC --> |"Prompt B"| OC["OpenClaw (2호기)\nDeepSeek V4 Pro"]
+    CC --> |"Prompt C"| AG["Antigravity\nGemini 계열"]
+    CC --> |"Prompt D"| CX["Codex\nGPT-5.x 계열"]
+    OMO --> |response| SYN["합성"]
+    OC --> |response| SYN
+    AG --> |response| SYN
+    CX --> |response| SYN
+    SYN --> R["통합 답변"]
+
+    style CC fill:#4a235a,stroke:#7d3c98,color:#fff
+    style OMO fill:#2d5016,stroke:#4a8c2a,color:#fff
+    style OC fill:#7b241c,stroke:#c0392b,color:#fff
+    style AG fill:#1a5276,stroke:#2e86c1,color:#fff
+    style CX fill:#5c1a5c,stroke:#9b2d9b,color:#fff
+```
+
+- **OpenCode (omo)**: Kimi 계열, 코딩·도구 호출·단일 파일 변경
+- **OpenClaw**: DeepSeek V4 Pro, 일반 추론·UX 관점·문서 표현
+- **Antigravity**: Gemini 계열, 대규모 문맥 점검·웹/브라우저 관점
+- **Codex**: GPT-5.x 계열, 정밀 보강·리뷰 관점
+
+**트레이드오프와 결과.** Hermes를 빼면서 397B 모델의 초기 로딩 병목이 사라져 전체 응답 시간의 상한이 개선됐다. Kimi·DeepSeek·Gemini·GPT로 서로 다른 모델 계열을 섞으니 단일 계열에 쏠리던 관점 편중도 줄었다. 다만 Codex는 코드 리뷰 게이트와 호출 쿼터를 공유하므로, 매 요청마다 부르는 대량 fan-out 슬롯이 아니라 정밀 보강이 필요한 국면에만 선택적으로 투입한다. Claude Code가 합성만 담당해 자체 쿼터 소모를 최소화한다는 원칙은 그대로 유지된다.
 
 ---
 
@@ -372,6 +411,7 @@ Agent Task Hub(ATH)는 다중 에이전트 환경의 리소스 경합과 컨텍�
 | 2026-04-08 | 전문적 어투로 리팩토링, OpenClaw 샌드박스 정책 반영 |
 | 2026-04-13 | 에이전트 목록 갱신, ATH PostgreSQL 전환/API 90여 개 확장/신뢰도 관리·교차검증 언급, 준수율 데이터 최신화, 문체 "~다" 체 통일 |
 | 2026-05-15 | 에이전트 6노드 체제로 전면 갱신(Agent PoC, OpenCode/omo, Hermes 신규), hocg 3-Way Fan-out 오케스트레이션 섹션 추가, Mermaid 다이어그램 6노드 반영 |
+| 2026-07-06 | hocg 워커 구성 4-Way 재편 반영(Hermes 제외, Antigravity·Codex 합류), DGX 서빙 모델 deepseek-v4-flash 전환에 따른 Hermes 백엔드 강등 맥락 추가 |
 
 ---
 
